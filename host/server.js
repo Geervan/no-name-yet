@@ -194,7 +194,7 @@ app.get('/api/agent/providers', authenticate, (req, res) => {
         { value: 'gpt-oss-120b-medium',    label: 'GPT-OSS 120B · Medium',          desc: 'Open-source backbone — good general coverage' },
       ],
     },
-    {
+    /*{
       value: 'copilot',
       label: 'GitHub Copilot',
       desc: 'Context-rich code completion and suggestion CLI',
@@ -202,7 +202,7 @@ app.get('/api/agent/providers', authenticate, (req, res) => {
         { value: 'gpt-4o',             label: 'GPT-4o',              desc: 'Default Copilot engine for code generation' },
         { value: 'claude-3.5-sonnet',  label: 'Claude 3.5 Sonnet',   desc: 'Copilot with Anthropic backend — strong debugging' },
       ],
-    },
+    },*/
     {
       value: 'codex',
       label: 'Codex CLI',
@@ -211,20 +211,20 @@ app.get('/api/agent/providers', authenticate, (req, res) => {
         { value: 'code-davinci-002',   label: 'Code Davinci 002',    desc: 'Legacy model — code translation and scaffolding' },
       ],
     },
-    {
+    /*{
       value: 'devin',
       label: 'Devin',
       desc: 'Autonomous full-stack engineering subagent',
       profiles: [
         { value: 'devin-autonomous',   label: 'Devin Autonomous',    desc: 'Multi-agent execution with sandbox environment' },
       ],
-    },
-    {
+    },*/
+    /*{
       value: 'ollama',
       label: 'Ollama (Local)',
       desc: 'Run open-source models on your host machine',
       profiles: [],
-    },
+    },*/
   ];
   res.json({ providers });
 });
@@ -413,6 +413,76 @@ app.post('/api/workspaces/register', authenticate, async (req, res) => {
     res.json({ status: 'success', workspace: name });
   } catch (err) {
     res.status(500).json({ error: `Directory validation failed: ${err.message}` });
+  }
+});
+
+// GitHub repos list
+app.get('/api/github/repos', authenticate, async (req, res) => {
+  const token = process.env.GITHUB_TOKEN;
+  const username = process.env.GITHUB_USERNAME;
+  if (!token || !username) return res.status(400).json({ error: 'GITHUB_TOKEN and GITHUB_USERNAME not configured in .env' });
+
+  try {
+    const { default: https } = await import('https');
+    const fetchPage = (page) => new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'api.github.com',
+        path: `/user/repos?per_page=100&page=${page}&sort=pushed&affiliation=owner,collaborator,organization_member&visibility=all`,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'User-Agent': 'Antigravity-Portable',
+          'Accept': 'application/vnd.github+json',
+        }
+      };
+      https.get(options, (r) => {
+        let data = '';
+        r.on('data', c => data += c);
+        r.on('end', () => {
+          try { resolve(JSON.parse(data)); }
+          catch { reject(new Error('Failed to parse GitHub response')); }
+        });
+      }).on('error', reject);
+    });
+
+    // Fetch up to 3 pages (300 repos)
+    let allRepos = [];
+    for (let page = 1; page <= 3; page++) {
+      const page_data = await fetchPage(page);
+      if (!Array.isArray(page_data)) {
+        // GitHub returned an error object
+        const msg = page_data.message || JSON.stringify(page_data);
+        return res.status(401).json({ error: `GitHub API error: ${msg}` });
+      }
+      allRepos = allRepos.concat(page_data);
+      if (page_data.length < 100) break;
+    }
+
+    // Get list of already-cloned workspaces
+    const clonedNames = new Set();
+    for (const root of WORKSPACES_ROOTS) {
+      if (fs.existsSync(root)) {
+        const items = fs.readdirSync(root, { withFileTypes: true });
+        items.filter(i => i.isDirectory()).forEach(i => clonedNames.add(i.name));
+      }
+    }
+    const customs = getCustomWorkspaces();
+    Object.keys(customs).forEach(k => clonedNames.add(k));
+
+    const repos = allRepos.map(r => ({
+      name: r.name,
+      fullName: r.full_name,
+      description: r.description || '',
+      private: r.private,
+      language: r.language || '',
+      pushedAt: r.pushed_at,
+      cloneUrl: r.clone_url,
+      sshUrl: r.ssh_url,
+      cloned: clonedNames.has(r.name),
+    }));
+
+    res.json({ repos });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
