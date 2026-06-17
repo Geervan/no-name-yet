@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ReactDOM from 'react-dom';
 import { Send, Loader, X, Terminal, ChevronDown, Check, FileText } from 'lucide-react';
 import { Terminal as XTerm } from 'xterm';
@@ -174,7 +174,7 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
   const providerAnchorRef = useRef(null);
   const profileAnchorRef  = useRef(null);
 
-  // Accept/reject state
+  const [authUrl, setAuthUrl] = useState(null);
   const [agentActionLoading, setAgentActionLoading] = useState(false);
   const [agentError, setAgentError]     = useState('');
   const [agentSuccess, setAgentSuccess] = useState('');
@@ -284,6 +284,26 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
       term.open(termContainerRef.current);
       termInstanceRef.current = term;
 
+      // iOS touch scrollback: translate swipe gestures into XTerm scroll
+      const container = termContainerRef.current;
+      let touchStartY = 0;
+      const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
+      const onTouchMove = (e) => {
+        const dy = touchStartY - e.touches[0].clientY;
+        touchStartY = e.touches[0].clientY;
+        const lines = Math.round(dy / 20);
+        if (lines !== 0) {
+          term.scrollLines(lines);
+          e.preventDefault();
+        }
+      };
+      container.addEventListener('touchstart', onTouchStart, { passive: true });
+      container.addEventListener('touchmove', onTouchMove, { passive: false });
+      term._touchCleanup = () => {
+        container.removeEventListener('touchstart', onTouchStart);
+        container.removeEventListener('touchmove', onTouchMove);
+      };
+
       term.onData((data) => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({ type: 'input', data }));
@@ -305,6 +325,9 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
 
     return () => {
       if (!hasTerminalSession && termInstanceRef.current) {
+        if (termInstanceRef.current._touchCleanup) {
+          termInstanceRef.current._touchCleanup();
+        }
         termInstanceRef.current.dispose();
         termInstanceRef.current = null;
       }
@@ -335,6 +358,9 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
     if (wsRef.current) wsRef.current.close();
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     if (termInstanceRef.current) {
+      if (termInstanceRef.current._touchCleanup) {
+        termInstanceRef.current._touchCleanup();
+      }
       termInstanceRef.current.dispose();
       termInstanceRef.current = null;
     }
@@ -453,6 +479,8 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
     setChangedFiles([]);
     setAgentError('');
     setAgentSuccess('');
+    setAuthUrl(null);
+    if (wsRef.current) wsRef.current._urlBuffer = '';
     agentDidWorkRef.current = false;
 
     // Snapshot workspace before agent writes anything
@@ -532,6 +560,17 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
           if (termInstanceRef.current) {
             termInstanceRef.current.write(payload.data);
           }
+          // Detect auth/login URLs — buffer last 2000 chars of output and scan the whole thing
+          // (URLs get split across multiple log chunks by the terminal)
+          if (!wsRef._urlBuffer) wsRef._urlBuffer = '';
+          wsRef._urlBuffer = (wsRef._urlBuffer + stripAnsi(payload.data)).slice(-2000);
+          // Remove spaces/newlines within URL (terminal word-wrap artifacts)
+          const cleanBuffer = wsRef._urlBuffer.replace(/\r?\n/g, '');
+          const urlMatch = cleanBuffer.match(/https:\/\/accounts\.google\.com\/[^\s"'<>]+|https:\/\/[^\s"'<>]*(?:login|auth|oauth|cloudflareaccess|argotunnel)[^\s"'<>]*/);
+          if (urlMatch) {
+            const url = urlMatch[0].replace(/\s+/g, '');
+            setAuthUrl(prev => prev === url ? prev : url);
+          }
           // Detect real agent work (tool use, edits, thoughts)
           if (!agentDidWorkRef.current && /Edit\(|Thought|✓|Write\(|Read\(/i.test(payload.data)) {
             agentDidWorkRef.current = true;
@@ -591,8 +630,6 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'input', data: text }));
     }
-    // Focus back to terminal — PTY echoes back the input via log messages
-    if (termInstanceRef.current) termInstanceRef.current.focus();
   };
 
   // ── Accept All: delete backup, keep agent's files ────────────────────────
@@ -692,6 +729,85 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
           )}
           {agentError && <div style={{ color: '#f87171', fontSize: '12px', fontWeight: '600' }}>✕ {agentError}</div>}
           {agentSuccess && <div style={{ color: 'var(--accent-color)', fontSize: '12px', fontWeight: '600' }}>✓ {agentSuccess}</div>}
+        </div>
+      )}
+
+      {/* ── Auth URL button — shown when CLI outputs a login link ── */}
+      {authUrl && (
+        <div style={{
+          background: 'rgba(234,179,8,0.08)',
+          border: '1px solid rgba(234,179,8,0.3)',
+          borderRadius: '12px',
+          padding: '12px 14px',
+          marginBottom: '16px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '10px',
+        }}>
+          <span style={{ fontSize: '12px', fontWeight: '700', color: '#fbbf24' }}>🔐 Authentication required</span>
+          <a
+            href={authUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              display: 'block',
+              background: 'linear-gradient(135deg,#d97706,#b45309)',
+              border: 'none',
+              borderRadius: '8px',
+              color: '#fff',
+              padding: '12px',
+              fontSize: '14px',
+              fontWeight: '700',
+              textAlign: 'center',
+              textDecoration: 'none',
+              boxShadow: '0 2px 16px rgba(217,119,6,0.4)',
+            }}
+          >
+            Open Login Link →
+          </a>
+          {/* Copyable full URL */}
+          <input
+            readOnly
+            value={authUrl}
+            onFocus={e => e.target.select()}
+            style={{
+              background: 'rgba(0,0,0,0.3)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              borderRadius: '8px',
+              padding: '8px 10px',
+              fontSize: '10px',
+              fontFamily: 'var(--font-mono)',
+              color: 'var(--text-secondary)',
+              wordBreak: 'break-all',
+              width: '100%',
+              boxSizing: 'border-box',
+              userSelect: 'all',
+            }}
+          />
+          <button
+            onMouseDown={e => e.preventDefault()}
+            onClick={() => navigator.clipboard?.writeText(authUrl).then(() => alert('Copied!')).catch(() => {})}
+            style={{
+              background: 'rgba(255,255,255,0.08)',
+              border: '1px solid rgba(255,255,255,0.15)',
+              borderRadius: '8px',
+              color: 'var(--text-primary)',
+              padding: '8px',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              width: '100%',
+            }}
+          >
+            📋 Copy Clean URL
+          </button>
+          <button
+            onMouseDown={e => e.preventDefault()}
+            onClick={() => setAuthUrl(null)}
+            style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', fontSize: '11px', cursor: 'pointer', textAlign: 'left' }}
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -921,7 +1037,6 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
           <div style={{ flex: 1, overflow: 'auto', padding: '8px 16px 8px 8px', minHeight: 0 }}>
             <div
               ref={fullscreenContainerRef}
-              onClick={() => termInstanceRef.current?.focus()}
               style={{ minWidth: 'max-content', minHeight: '100%' }}
             />
           </div>          {running && (
@@ -973,24 +1088,24 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
               </div>
             </div>
 
-            {/* Terminal container — scrollable wrapper around XTerm canvas */}
+            {/* Terminal container — xterm manages its own scroll internally */}
             <div
               style={{
                 height: termFullscreen ? '1px' : '320px',
                 border: '1px solid var(--border-glow)',
                 borderRadius: '8px',
-                overflow: 'auto',
+                overflow: 'hidden',
                 background: '#070709',
                 cursor: 'text',
                 visibility: termFullscreen ? 'hidden' : 'visible',
               }}
+              onClick={() => termInstanceRef.current?.focus()}
             >
               <div
                 ref={termContainerRef}
-                onClick={() => termInstanceRef.current?.focus()}
                 style={{
                   padding: '8px',
-                  minWidth: 'max-content',
+                  height: '100%',
                 }}
               />
             </div>
@@ -1006,7 +1121,7 @@ export default function AgentTab({ apiHost, wsHost, token, activeWorkspace, term
                   { label: '↑',       value: '\x1b[A',   color: 'var(--text-secondary)', bg: 'rgba(255,255,255,0.05)', border: 'var(--border-glow)' },
                   { label: '↓',       value: '\x1b[B',   color: 'var(--text-secondary)', bg: 'rgba(255,255,255,0.05)', border: 'var(--border-glow)' },
                 ].map(({ label, value, color, bg, border }) => (
-                  <button key={label} onClick={() => sendToAgent(value)} style={{ background: bg, border: `1px solid ${border}`, borderRadius: '6px', color, padding: '8px 12px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', fontFamily: 'var(--font-mono)', userSelect: 'none', WebkitTapHighlightColor: 'transparent', flexShrink: 0 }}>{label}</button>
+                  <button key={label} onMouseDown={e => e.preventDefault()} onClick={() => sendToAgent(value)} style={{ background: bg, border: `1px solid ${border}`, borderRadius: '6px', color, padding: '8px 12px', fontSize: '13px', fontWeight: '700', cursor: 'pointer', fontFamily: 'var(--font-mono)', userSelect: 'none', WebkitTapHighlightColor: 'transparent', flexShrink: 0 }}>{label}</button>
                 ))}
                 {/* Ctrl+C pushed right */}
                 <button onClick={() => sendToAgent('\x03')} style={{ marginLeft: 'auto', background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.2)', borderRadius: '6px', color: '#fbbf24', padding: '8px 12px', fontSize: '11px', fontWeight: '700', cursor: 'pointer', fontFamily: 'var(--font-mono)', userSelect: 'none', WebkitTapHighlightColor: 'transparent', flexShrink: 0 }}>⌃C</button>

@@ -5,8 +5,10 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { spawn, exec } from 'child_process';
 import { fileURLToPath } from 'url';
+import zlib from 'zlib';
 import pty from 'node-pty';
 
 // Load config
@@ -170,6 +172,107 @@ const resolveWorkspacePath = (workspaceName, subPath = '') => {
 };
 
 // --- REST Endpoints ---
+
+// ── Live port proxy — forwards /preview/<port>/* to localhost:<port> ─────────
+// Used by PreviewTab to embed running dev servers in an iframe
+app.all('/preview/:port*', (req, res) => {
+  const tokenParam = req.query.token;
+  if (tokenParam !== SECURITY_TOKEN) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const port = parseInt(req.params.port, 10);
+  if (!port || port < 1024 || port > 65535) {
+    return res.status(400).send('Invalid port');
+  }
+
+  // Build target path — strip /preview/<port> prefix and our token params
+  const suffix = req.params[0] || '/';
+  const urlObj = new URL(`http://localhost${suffix || '/'}`);
+  urlObj.searchParams.delete('token');
+  urlObj.searchParams.delete('t');
+  const targetPath = (urlObj.pathname || '/') + (urlObj.search || '');
+
+  const options = {
+    hostname: 'localhost',
+    port,
+    path: targetPath,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: `localhost:${port}`,
+      // Accept both compressed and plain — we'll handle decompression ourselves
+      'accept-encoding': 'gzip, deflate',
+    },
+  };
+  delete options.headers['authorization'];
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    const contentType = proxyRes.headers['content-type'] || '';
+    const encoding = proxyRes.headers['content-encoding'] || '';
+    const isHtml = contentType.includes('text/html');
+
+    // Strip headers that block iframe embedding
+    const outHeaders = { ...proxyRes.headers };
+    delete outHeaders['x-frame-options'];
+    delete outHeaders['content-security-policy'];
+    delete outHeaders['content-security-policy-report-only'];
+
+    // Rewrite redirect locations to stay within the proxy
+    if (outHeaders.location) {
+      const loc = outHeaders.location;
+      if (loc.startsWith('/') && !loc.startsWith(`/preview/${port}`)) {
+        outHeaders.location = `/preview/${port}${loc}`;
+      } else {
+        outHeaders.location = loc.replace(/^https?:\/\/localhost:\d+/, `/preview/${port}`);
+      }
+    }
+
+    // For HTML: decompress if needed, rewrite asset paths, re-send as plain utf8
+    if (isHtml) {
+      delete outHeaders['content-encoding'];
+      delete outHeaders['content-length']; // will change after rewrite
+
+      let stream = proxyRes;
+      if (encoding === 'gzip') {
+        stream = proxyRes.pipe(zlib.createGunzip());
+      } else if (encoding === 'deflate') {
+        stream = proxyRes.pipe(zlib.createInflate());
+      } else if (encoding === 'br') {
+        stream = proxyRes.pipe(zlib.createBrotliDecompress());
+      }
+
+      let body = '';
+      stream.setEncoding('utf8');
+      stream.on('data', chunk => { body += chunk; });
+      stream.on('end', () => {
+        // Rewrite absolute asset paths so they route through the proxy
+        const rewritten = body
+          .replace(/(src|href|action)="\//g,   `$1="/preview/${port}/`)
+          .replace(/(src|href|action)='\//g,   `$1='/preview/${port}/`)
+          .replace(/url\(\//g,                  `url(/preview/${port}/`);
+        outHeaders['content-length'] = Buffer.byteLength(rewritten, 'utf8');
+        res.writeHead(proxyRes.statusCode, outHeaders);
+        res.end(rewritten, 'utf8');
+      });
+      stream.on('error', () => {
+        if (!res.headersSent) res.status(502).send('Decompression error');
+      });
+    } else {
+      // Non-HTML: pass through as-is (images, JS, CSS etc.)
+      res.writeHead(proxyRes.statusCode, outHeaders);
+      proxyRes.pipe(res, { end: true });
+    }
+  });
+
+  proxyReq.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(502).send(`Cannot connect to localhost:${port} — is the dev server running?\n\n${err.message}`);
+    }
+  });
+
+  req.pipe(proxyReq, { end: true });
+});
 
 // Check authentication
 app.get('/api/auth/check', authenticate, (req, res) => {
@@ -375,7 +478,7 @@ app.get('/api/workspaces', authenticate, async (req, res) => {
         items
           .filter(item => item.isDirectory())
           .map(item => item.name)
-          .filter(name => !['node_modules', '.git', 'host', 'client', '.agents', '.gemini'].includes(name))
+          .filter(name => !['node_modules', '.git', 'host', 'client', '.agents', '.gemini'].includes(name) && !name.endsWith('.agent-backup'))
           .forEach(name => {
             if (!localWorkspaces.includes(name)) {
               localWorkspaces.push(name);
@@ -1192,6 +1295,17 @@ app.all('/preview/:port/*', async (req, res) => {
 const terminals = new Map(); // stores PTY / spawn objects
 const terminalBuffers = new Map(); // stores buffered output to catch up client
 
+// Keepalive: ping all clients every 30s to prevent Cloudflare 100s timeout
+const keepAliveInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === 1) {
+      ws.ping();
+    }
+  });
+}, 30000);
+
+wss.on('close', () => clearInterval(keepAliveInterval));
+
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const token = url.searchParams.get('token');
@@ -1364,7 +1478,7 @@ wss.on('connection', (ws, req) => {
     }
 
     // Save prompt & model details to brain folder for active AI session reference
-    const brainDir = 'C:/Users/Geervan/.gemini/antigravity-ide/brain/8c76bd4c-a3f4-407f-8490-f5ffafcd2e55';
+    const brainDir = process.env.BRAIN_DIR || path.join(os.homedir(), '.gemini', 'antigravity-ide', 'brain');
     try {
       if (fs.existsSync(brainDir)) {
         const reqPath = path.join(brainDir, 'agent_request.json');
@@ -1400,16 +1514,9 @@ wss.on('connection', (ws, req) => {
         const parts = process.env.ANTIGRAVITY_CLI_PATH.trim().split(/\s+/);
         cmd = parts[0];
         const baseArgs = parts.slice(1);
-        if (baseArgs.length > 0) {
-          args = [...baseArgs, '--profile', model, '--dangerously-skip-permissions', '--prompt', prompt];
-        } else {
-          args = ['run', '--profile', model, '--dangerously-skip-permissions', '--prompt', prompt];
-        }
+        args = [...baseArgs, 'chat', '--profile', model, '--dangerously-skip-permissions', prompt];
       } else {
-        cmd = 'D:\\Antigravity\\bin\\antigravity.cmd';
-        if (!fs.existsSync(cmd)) {
-          cmd = 'antigravity';
-        }
+        cmd = 'agy';
         args = ['chat', '--profile', model, '--dangerously-skip-permissions', prompt];
       }
     } else if (provider === 'copilot') {
@@ -1525,4 +1632,22 @@ function broadcastToTerminal(termId, message) {
 server.listen(PORT, () => {
   console.log(`[Host Daemon] Listening on http://localhost:${PORT}`);
   console.log(`[Host Daemon] Workspaces directory: ${WORKSPACES_ROOT}`);
+
+  // On startup, clean up any leftover .agent-backup folders (treat as accepted)
+  for (const root of WORKSPACES_ROOTS) {
+    if (!fs.existsSync(root)) continue;
+    try {
+      const entries = fs.readdirSync(root, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.endsWith('.agent-backup')) {
+          const backupPath = path.join(root, entry.name);
+          fs.rm(backupPath, { recursive: true, force: true }, (err) => {
+            if (!err) console.log(`[Host Daemon] Cleaned up stale backup: ${backupPath}`);
+          });
+        }
+      }
+    } catch (err) {
+      console.error('[Host Daemon] Backup cleanup error:', err.message);
+    }
+  }
 });

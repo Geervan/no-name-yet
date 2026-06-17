@@ -87,7 +87,7 @@ function parseProblemsFromBuffer(bufferText) {
 }
 
 export default function App() {
-  const [apiHost, setApiHost] = useState(() => localStorage.getItem('portable_api_host') || 'http://localhost:5000');
+  const [apiHost, setApiHost] = useState(() => localStorage.getItem('portable_api_host') || 'http://localhost:8000');
   const [token, setToken] = useState(() => localStorage.getItem('portable_token') || 'dev-secret-token-123456');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authChecking, setAuthChecking] = useState(true);
@@ -124,22 +124,29 @@ export default function App() {
   const checkAuth = async (hostToCheck, tokenToCheck) => {
     setAuthChecking(true);
     setAuthError('');
+    // Normalize host: strip trailing slash, ensure protocol
+    let normalizedHost = hostToCheck.trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(normalizedHost)) {
+      normalizedHost = 'https://' + normalizedHost;
+    }
     try {
-      const res = await fetch(`${hostToCheck}/api/auth/check`, {
-        headers: { 'Authorization': `Bearer ${tokenToCheck}` }
+      const res = await fetch(`${normalizedHost}/api/auth/check`, {
+        headers: { 'Authorization': `Bearer ${tokenToCheck.trim()}` }
       });
       if (res.status === 200) {
         setIsAuthenticated(true);
-        localStorage.setItem('portable_api_host', hostToCheck);
-        localStorage.setItem('portable_token', tokenToCheck);
-        setApiHost(hostToCheck);
-        setToken(tokenToCheck);
+        localStorage.setItem('portable_api_host', normalizedHost);
+        localStorage.setItem('portable_token', tokenToCheck.trim());
+        setApiHost(normalizedHost);
+        setToken(tokenToCheck.trim());
       } else {
-        throw new Error(`Auth failed with status ${res.status}`);
+        const body = await res.text().catch(() => '');
+        setIsAuthenticated(false);
+        setAuthError(`Auth failed (${res.status}): ${body || 'Invalid token'}`);
       }
     } catch (err) {
       setIsAuthenticated(false);
-      setAuthError('Connection failed: Check Daemon URL and Token');
+      setAuthError(`Connection failed: ${err.message}`);
     } finally {
       setAuthChecking(false);
     }

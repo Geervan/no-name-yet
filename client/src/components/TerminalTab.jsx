@@ -43,11 +43,14 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
   };
 
   // Helper to spawn a terminal session
-  const initTerminal = (sessionId) => {
+  const initTerminal = (sessionId, retryDelay = 1000) => {
     if (!activeWorkspace) return;
-    
+
     // Clean up if already exists
     if (termInstances.current[sessionId]) {
+      if (termInstances.current[sessionId]._touchCleanup) {
+        termInstances.current[sessionId]._touchCleanup();
+      }
       termInstances.current[sessionId].dispose();
     }
     if (sockets.current[sessionId]) {
@@ -60,6 +63,9 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
     // Create XTerm instance with custom tech styling
     const term = new XTerm({
       cursorBlink: true,
+      scrollback: 5000,
+      cols: 220,
+      rows: 24,
       theme: {
         background: '#0a0a0a',
         foreground: '#10b981', // green text
@@ -68,11 +74,36 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
       },
       fontSize: 12,
       fontFamily: 'var(--font-mono)',
-      convertEol: true
+      convertEol: true,
     });
 
-    term.open(container);
     term.loadAddon(new WebLinksAddon());
+    term.open(container);
+
+    // iOS touch scrollback: translate swipe gestures into XTerm scroll
+    let touchStartY = 0;
+    const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
+    const onTouchMove = (e) => {
+      const dy = touchStartY - e.touches[0].clientY;
+      touchStartY = e.touches[0].clientY;
+      // Each ~20px of swipe = 1 line scroll
+      const lines = Math.round(dy / 20);
+      if (lines !== 0) {
+        term.scrollLines(lines);
+        e.preventDefault();
+      }
+    };
+    container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchmove', onTouchMove, { passive: false });
+    // Store cleanup refs on the term object
+    term._touchCleanup = () => {
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
+    };
+
+    // Focus so keyboard input is captured immediately
+    setTimeout(() => term.focus(), 80);
+
     term.write('Connecting to persistent terminal server...\n');
     termInstances.current[sessionId] = term;
 
@@ -80,6 +111,11 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
     const wsUrl = `${wsHost}/ws/terminal/${sessionId}?workspace=${encodeURIComponent(activeWorkspace)}&token=${token}`;
     const ws = new WebSocket(wsUrl);
     sockets.current[sessionId] = ws;
+
+    ws.onopen = () => {
+      // Reset retry delay on successful connection
+      sockets.current[sessionId]._retryDelay = 1000;
+    };
 
     ws.onmessage = (event) => {
       try {
@@ -107,22 +143,45 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
     });
 
     ws.onclose = () => {
-      term.write('\r\n[WebSocket connection closed]');
+      if (document.hidden) {
+        // Tab is in background — reconnect when visible again
+        const onVisible = () => {
+          document.removeEventListener('visibilitychange', onVisible);
+          if (sockets.current[sessionId] === ws) {
+            initTerminal(sessionId, 1000);
+          }
+        };
+        document.addEventListener('visibilitychange', onVisible);
+        return;
+      }
+      // Tab is visible — reconnect with backoff
+      const delay = Math.min((ws._retryDelay || 1000) * 1.5, 15000);
+      term.write(`\r\n[Reconnecting in ${Math.round(delay / 1000)}s...]\r\n`);
+      setTimeout(() => {
+        if (sockets.current[sessionId] === ws) {
+          initTerminal(sessionId, delay);
+        }
+      }, delay);
     };
 
     ws.onerror = () => {
       term.write('\r\n[Connection Error]');
     };
+
+    ws._retryDelay = retryDelay;
   };
 
   useEffect(() => {
     if (activeWorkspace && activeSession !== 'problems') {
       initTerminal(activeSession);
     }
-    
+
     return () => {
       // Clean up all sessions on unmount
       Object.keys(termInstances.current).forEach(id => {
+        if (termInstances.current[id]._touchCleanup) {
+          termInstances.current[id]._touchCleanup();
+        }
         termInstances.current[id].dispose();
       });
       Object.keys(sockets.current).forEach(id => {
@@ -130,6 +189,13 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
       });
     };
   }, [activeWorkspace, activeSession]);
+
+  // Re-focus the terminal whenever switching to a shell session
+  useEffect(() => {
+    if (activeSession !== 'problems' && termInstances.current[activeSession]) {
+      setTimeout(() => termInstances.current[activeSession]?.focus(), 80);
+    }
+  }, [activeSession]);
 
   const addSession = () => {
     let idx = 1;
@@ -144,7 +210,7 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
   const removeSession = (id, e) => {
     e.stopPropagation();
     if (sessions.length === 1) return; // keep at least one
-    
+
     // Clean up
     if (termInstances.current[id]) {
       termInstances.current[id].dispose();
@@ -154,7 +220,7 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
       sockets.current[id].close();
       delete sockets.current[id];
     }
-    
+
     const nextSessions = sessions.filter(s => s !== id);
     setSessions(nextSessions);
     if (activeSession === id) {
@@ -276,7 +342,7 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
           </span>
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
             <button
-              onClick={() => runQuickCommand('npm run dev')}
+              onClick={() => runQuickCommand('npm run dev -- -p 3000')}
               style={{
                 background: 'rgba(16, 185, 129, 0.1)',
                 border: '1px solid var(--border-accent)',
@@ -345,7 +411,7 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
 
       {/* Terminal View Container */}
       <div className="double-bezel-card" style={{ height: '400px', background: '#0a0a0a', display: 'flex', flexDirection: 'column' }}>
-        <div className="double-bezel-card-inner" style={{ padding: '8px', flex: 1, background: '#0a0a0a', overflowY: activeSession === 'problems' ? 'auto' : 'hidden' }}>
+        <div className="double-bezel-card-inner" style={{ padding: '8px', flex: 1, background: '#0a0a0a', overflow: activeSession === 'problems' ? 'auto' : 'hidden' }}>
           {activeSession === 'problems' ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', padding: '4px' }}>
               {problems.length === 0 ? (
@@ -358,7 +424,7 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
                   const isExpanded = expandedFiles[filePath] !== false; // default true
                   const errorsCount = fileIssues.filter(i => i.type === 'error').length;
                   const warningsCount = fileIssues.filter(i => i.type === 'warning').length;
-                  
+
                   return (
                     <div key={filePath} style={{ display: 'flex', flexDirection: 'column', border: '1px solid var(--border-glow)', borderRadius: '8px', overflow: 'hidden' }}>
                       {/* File Group Header */}
@@ -393,7 +459,7 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
                             {filePath}
                           </span>
                         </div>
-                        
+
                         <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
                           {errorsCount > 0 && (
                             <span style={{ fontSize: '9px', fontWeight: '700', background: 'rgba(239, 68, 68, 0.15)', color: '#f87171', padding: '2px 6px', borderRadius: '4px' }}>
@@ -436,7 +502,7 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
                                 marginTop: '6px',
                                 flexShrink: 0
                               }} />
-                              
+
                               <span style={{
                                 fontFamily: 'var(--font-mono)',
                                 fontSize: '10px',
@@ -449,7 +515,7 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
                               }}>
                                 {prob.line}:{prob.column || 1}
                               </span>
-                              
+
                               <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flex: 1, minWidth: 0 }}>
                                 <p style={{ fontSize: '11px', color: 'var(--text-primary)', lineHeight: '1.4', margin: 0, wordBreak: 'break-word' }}>
                                   {prob.msg}
@@ -472,10 +538,15 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
               <div
                 key={id}
                 ref={(el) => (termContainers.current[id] = el)}
+                onClick={() => termInstances.current[id]?.focus()}
                 style={{
                   display: activeSession === id ? 'block' : 'none',
                   height: '100%',
-                  background: '#0a0a0a'
+                  overflowX: 'auto',
+                  overflowY: 'hidden',
+                  background: '#0a0a0a',
+                  cursor: 'text',
+                  touchAction: 'pan-y',
                 }}
               />
             ))

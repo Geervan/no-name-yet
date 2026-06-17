@@ -45,15 +45,14 @@ export default function PreviewTab({ apiHost, wsHost, token, activeWorkspace }) 
   }, [activeWorkspace]);
 
   const handleReload = () => {
-    // Force iframe reload by appending timestamp
-    setPreviewUrl(`${apiHost}/preview/${port}/?t=${Date.now()}`);
+    setPreviewUrl(`${apiHost}/preview/${port}/?token=${encodeURIComponent(token)}&t=${Date.now()}`);
   };
 
   useEffect(() => {
     if (port) {
-      setPreviewUrl(`${apiHost}/preview/${port}/`);
+      setPreviewUrl(`${apiHost}/preview/${port}/?token=${encodeURIComponent(token)}`);
     }
-  }, [port, apiHost]);
+  }, [port, apiHost, token]);
 
   if (!activeWorkspace) {
     return (
@@ -70,7 +69,7 @@ export default function PreviewTab({ apiHost, wsHost, token, activeWorkspace }) 
       {/* Port Config and Controls */}
       <div className="double-bezel-card" style={{ marginBottom: '12px' }}>
         <div className="double-bezel-card-inner" style={{ padding: '12px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justify: 'space-between', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1 }}>
               <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontWeight: '700' }}>PORT:</span>
               <input
@@ -81,20 +80,10 @@ export default function PreviewTab({ apiHost, wsHost, token, activeWorkspace }) 
                 style={{ width: '80px', padding: '6px 10px', height: '32px', fontSize: '13px', marginBottom: '0' }}
               />
             </div>
-            
             <div style={{ display: 'flex', gap: '6px' }}>
               <button
                 onClick={handleReload}
-                style={{
-                  background: 'rgba(255,255,255,0.03)',
-                  border: '1px solid var(--border-glow)',
-                  borderRadius: '8px',
-                  padding: '6px',
-                  color: 'var(--text-primary)',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center'
-                }}
+                style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-glow)', borderRadius: '8px', padding: '6px', color: 'var(--text-primary)', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
                 title="Reload Preview"
               >
                 <RefreshCcw size={14} />
@@ -103,15 +92,7 @@ export default function PreviewTab({ apiHost, wsHost, token, activeWorkspace }) 
                 href={previewUrl}
                 target="_blank"
                 rel="noreferrer"
-                style={{
-                  background: 'rgba(16, 185, 129, 0.1)',
-                  border: '1px solid var(--border-accent)',
-                  borderRadius: '8px',
-                  padding: '6px',
-                  color: 'var(--accent-color)',
-                  display: 'flex',
-                  alignItems: 'center'
-                }}
+                style={{ background: 'rgba(16, 185, 129, 0.1)', border: '1px solid var(--border-accent)', borderRadius: '8px', padding: '6px', color: 'var(--accent-color)', display: 'flex', alignItems: 'center' }}
                 title="Open in new tab"
               >
                 <ExternalLink size={14} />
@@ -125,17 +106,47 @@ export default function PreviewTab({ apiHost, wsHost, token, activeWorkspace }) 
       <div className="double-bezel-card" style={{ flex: 1, minHeight: '340px', position: 'relative', marginBottom: '16px' }}>
         <div className="double-bezel-card-inner" style={{ padding: '0', height: '100%', minHeight: '324px', overflow: 'hidden', position: 'relative', borderRadius: '18px' }}>
           {previewUrl ? (
-            <iframe
-              src={previewUrl}
-              style={{
-                width: '100%',
-                height: '100%',
-                border: 'none',
-                background: '#ffffff',
-                borderRadius: '16px'
-              }}
-              title="Live Preview"
-            />
+            <>
+              <iframe
+                src={previewUrl}
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  border: 'none',
+                  background: '#ffffff',
+                  borderRadius: '16px'
+                }}
+                title="Live Preview"
+                sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-top-navigation"
+              />
+              {/* Open in browser overlay — for complex apps that don't iframe well */}
+              <a
+                href={previewUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{
+                  position: 'absolute',
+                  bottom: '12px',
+                  right: '12px',
+                  background: 'rgba(5,5,5,0.9)',
+                  border: '1px solid var(--border-accent)',
+                  padding: '8px 14px',
+                  borderRadius: '99px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  fontSize: '11px',
+                  fontWeight: '700',
+                  color: 'var(--accent-color)',
+                  textDecoration: 'none',
+                  backdropFilter: 'blur(8px)',
+                  boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+                }}
+              >
+                <ExternalLink size={12} />
+                Open in browser
+              </a>
+            </>
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
               No port active
