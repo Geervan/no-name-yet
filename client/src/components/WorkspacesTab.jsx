@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Folder, Plus, GitBranch, ArrowRight, Activity, Link2, Search, Lock, Globe, Code, RefreshCw, Check } from 'lucide-react';
+import { Folder, Plus, GitBranch, ArrowRight, Activity, Link2, Search, Lock, Globe, Code, RefreshCw, Check, Trash2 } from 'lucide-react';
 
 export default function WorkspacesTab({ apiHost, token, activeWorkspace, onSelectWorkspace }) {
   const [workspaces, setWorkspaces] = useState([]);
@@ -29,6 +29,32 @@ export default function WorkspacesTab({ apiHost, token, activeWorkspace, onSelec
   // Active section
   const [activeSection, setActiveSection] = useState('github'); // 'github' | 'manual'
   const [manualSearch, setManualSearch] = useState('');
+
+  const [modalConfig, setModalConfig] = useState(null);
+  const [deleteFilesChecked, setDeleteFilesChecked] = useState(false);
+
+  const handleDeleteWorkspace = async (workspaceName, deleteFiles) => {
+    setError('');
+    try {
+      const res = await fetch(`${apiHost}/api/workspaces/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ workspace: workspaceName, deleteFiles })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      
+      // If we deleted the currently active workspace, clear it
+      if (activeWorkspace === workspaceName) {
+        onSelectWorkspace('');
+      }
+      
+      fetchWorkspaces();
+      fetchRepos();
+    } catch (err) {
+      setError(err.message || 'Failed to delete workspace');
+    }
+  };
 
   const fetchWorkspaces = async () => {
     setLoading(true);
@@ -353,23 +379,59 @@ export default function WorkspacesTab({ apiHost, token, activeWorkspace, onSelec
                   {workspaces.filter(n => n.toLowerCase().includes(manualSearch.toLowerCase())).map(name => {
                     const isActive = activeWorkspace === name;
                     return (
-                      <button
+                      <div
                         key={name}
-                        onClick={() => onSelectWorkspace(name)}
                         style={{
                           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                          padding: '10px 12px', borderRadius: '8px', cursor: 'pointer', border: 'none',
+                          padding: '10px 12px', borderRadius: '8px',
                           background: isActive ? 'rgba(0,255,102,0.08)' : 'rgba(255,255,255,0.02)',
-                          color: isActive ? 'var(--accent-color)' : 'var(--text-primary)',
-                          fontSize: '13px', fontWeight: '600', textAlign: 'left',
+                          border: isActive ? '1px solid var(--border-accent)' : '1px solid var(--border-glow)',
                         }}
                       >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <button
+                          onClick={() => onSelectWorkspace(name)}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: isActive ? 'var(--accent-color)' : 'var(--text-primary)',
+                            fontSize: '13px', fontWeight: '600', textAlign: 'left',
+                            display: 'flex', alignItems: 'center', gap: '8px',
+                            cursor: 'pointer', flex: 1, padding: 0, outline: 'none'
+                          }}
+                        >
                           <Folder size={14} />
                           <span>{name}</span>
+                        </button>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          {isActive && <span style={{ fontSize: '9px', background: 'var(--accent-color)', color: '#000', padding: '2px 6px', borderRadius: '4px', fontWeight: '800' }}>ACTIVE</span>}
+                          <button
+                            onClick={() => {
+                              setDeleteFilesChecked(false);
+                              setModalConfig({
+                                workspaceName: name,
+                                title: 'Delete Workspace',
+                                message: `Are you sure you want to remove "${name}" from your workspaces?`
+                              });
+                            }}
+                            style={{
+                              background: 'transparent',
+                              border: 'none',
+                              color: 'var(--text-muted)',
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              padding: '4px',
+                              transition: 'color 0.2s',
+                              outline: 'none'
+                            }}
+                            onMouseEnter={(e) => e.currentTarget.style.color = '#ef4444'}
+                            onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-muted)'}
+                            title="Delete Workspace"
+                          >
+                            <Trash2 size={13} />
+                          </button>
                         </div>
-                        {isActive ? <span style={{ fontSize: '9px', background: 'var(--accent-color)', color: '#000', padding: '2px 6px', borderRadius: '4px', fontWeight: '800' }}>ACTIVE</span> : <ArrowRight size={13} />}
-                      </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -430,6 +492,73 @@ export default function WorkspacesTab({ apiHost, token, activeWorkspace, onSelec
             </div>
           </div>
         </>
+      )}
+
+      {/* Custom dialog modal overlay */}
+      {modalConfig && (
+        <div style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(5, 5, 8, 0.85)',
+          backdropFilter: 'blur(6px)',
+          zIndex: 300,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '16px'
+        }}>
+          <div className="double-bezel-card" style={{ width: '100%', maxWidth: '360px', marginBottom: '0' }}>
+            <div className="double-bezel-card-inner">
+              <h3 style={{ fontSize: '15px', fontWeight: '700', marginBottom: '10px', color: 'var(--text-primary)' }}>
+                {modalConfig.title}
+              </h3>
+              <p className="text-sub" style={{ marginBottom: '16px', fontSize: '13px', lineHeight: '1.5' }}>
+                {modalConfig.message}
+              </p>
+              
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '18px' }}>
+                <input
+                  type="checkbox"
+                  id="deleteFilesCheckbox"
+                  checked={deleteFilesChecked}
+                  onChange={(e) => setDeleteFilesChecked(e.target.checked)}
+                  style={{ cursor: 'pointer', accentColor: '#ef4444' }}
+                />
+                <label htmlFor="deleteFilesCheckbox" style={{ fontSize: '12px', color: 'var(--text-secondary)', cursor: 'pointer', userSelect: 'none' }}>
+                  Also delete project files from disk
+                </label>
+              </div>
+              
+              <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+                <button
+                  onClick={() => setModalConfig(null)}
+                  className="btn-secondary"
+                  style={{ padding: '8px 12px', fontSize: '11px', width: 'auto', boxShadow: 'none' }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    handleDeleteWorkspace(modalConfig.workspaceName, deleteFilesChecked);
+                    setModalConfig(null);
+                  }}
+                  className="btn-primary"
+                  style={{
+                    padding: '8px 16px',
+                    fontSize: '11px',
+                    width: 'auto',
+                    boxShadow: 'none',
+                    background: '#ef4444',
+                    color: '#fff',
+                    borderColor: '#ef4444'
+                  }}
+                >
+                  Confirm Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

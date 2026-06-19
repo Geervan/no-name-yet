@@ -106,6 +106,34 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
     }
   };
 
+  const handleGitInit = async () => {
+    setGitRunning(true);
+    setError('');
+    setLog('');
+    try {
+      const res = await fetch(`${apiHost}/api/git/init`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ workspace: activeWorkspace })
+      });
+      const data = await safeParseResponse(res);
+      if (res.ok) {
+        setLog(data.log || 'Initialized Git repository successfully.');
+        fetchGitStatus();
+        fetchBranches();
+      } else {
+        setError(data.error || 'Failed to initialize Git repository.');
+      }
+    } catch (err) {
+      setError(`Git init failed: ${err.message}`);
+    } finally {
+      setGitRunning(false);
+    }
+  };
+
   const handleCheckoutBranch = async (branchName) => {
     if (!branchName || branchName === selectedBranch) return;
     setGitRunning(true);
@@ -383,6 +411,46 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
     return (
       <div className="tab-panel" style={{ textAlign: 'center', marginTop: '40px' }}>
         <p className="text-sub">Please select a workspace to manage Git repository.</p>
+      </div>
+    );
+  }
+
+  const isNotGitRepo = error && (error.toLowerCase().includes('not a git repository') || error.toLowerCase().includes('not a git repo'));
+
+  if (isNotGitRepo) {
+    return (
+      <div className="tab-panel" style={{ marginBottom: '100px' }}>
+        <div className="eyebrow-badge">Repository Versioning</div>
+        <h2 className="section-title">Git Control</h2>
+        
+        <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginBottom: '16px', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span>Directory:</span>
+          <span style={{ color: 'var(--accent-color)' }}>/{activeWorkspace}</span>
+        </div>
+
+        <div className="double-bezel-card" style={{ borderColor: 'rgba(239, 68, 68, 0.15)' }}>
+          <div className="double-bezel-card-inner" style={{ padding: '24px', textAlign: 'center' }}>
+            <div style={{ color: '#ef4444', marginBottom: '12px' }}>
+              <GitCommit size={32} style={{ opacity: 0.8, margin: '0 auto' }} />
+            </div>
+            <h3 style={{ fontSize: '15px', fontWeight: '700', marginBottom: '8px', color: 'var(--text-primary)' }}>Not a Git Repository</h3>
+            <p className="text-sub" style={{ fontSize: '12px', marginBottom: '20px', lineHeight: '1.5', maxWidth: '300px', margin: '0 auto 20px' }}>
+              Git version control is not initialized in this workspace folder.
+            </p>
+            
+            <button
+              onClick={handleGitInit}
+              disabled={gitRunning}
+              className="btn-primary"
+              style={{ margin: '0 auto', width: 'auto', padding: '10px 20px' }}
+            >
+              <span>{gitRunning ? 'Initializing...' : 'Initialize Git Repository'}</span>
+              <div className="btn-icon-wrapper">
+                <Check size={14} />
+              </div>
+            </button>
+          </div>
+        </div>
       </div>
     );
   }

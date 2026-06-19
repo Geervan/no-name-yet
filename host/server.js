@@ -722,7 +722,12 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
       } else if (loc.startsWith('/') && !loc.startsWith(gwBase)) {
         outHeaders.location = gwBase + loc;
       } else {
-        outHeaders.location = loc.replace(/^https?:\/\/localhost:\d+/, '');
+        const relativeLoc = loc.replace(/^https?:\/\/(localhost|127\.0\.0\.1):\d+/, '');
+        if (relativeLoc.startsWith('/') && !relativeLoc.startsWith(gwBase)) {
+          outHeaders.location = gwBase + relativeLoc;
+        } else {
+          outHeaders.location = relativeLoc;
+        }
       }
     }
 
@@ -914,7 +919,12 @@ app.all('/preview/:port*', (req, res) => {
       if (loc.startsWith('/') && !loc.startsWith(`/preview/${port}`)) {
         outHeaders.location = `/preview/${port}${loc}`;
       } else {
-        outHeaders.location = loc.replace(/^https?:\/\/localhost:\d+/, `/preview/${port}`);
+        const relativeLoc = loc.replace(/^https?:\/\/(localhost|127\.0\.0\.1):\d+/, '');
+        if (relativeLoc.startsWith('/') && !relativeLoc.startsWith(`/preview/${port}`)) {
+          outHeaders.location = `/preview/${port}${relativeLoc}`;
+        } else {
+          outHeaders.location = relativeLoc;
+        }
       }
     }
 
@@ -1311,6 +1321,53 @@ app.post('/api/workspaces/register', authenticate, async (req, res) => {
     res.json({ status: 'success', workspace: name });
   } catch (err) {
     res.status(500).json({ error: `Directory validation failed: ${err.message}` });
+  }
+});
+
+// Delete workspace
+app.post('/api/workspaces/delete', authenticate, async (req, res) => {
+  const { workspace, deleteFiles } = req.body;
+  if (!workspace) return res.status(400).json({ error: 'Missing workspace' });
+
+  try {
+    const customs = getCustomWorkspaces();
+    let isCustom = false;
+    let customPath = null;
+    if (customs[workspace]) {
+      isCustom = true;
+      customPath = customs[workspace];
+      delete customs[workspace];
+      saveCustomWorkspaces(customs);
+    }
+
+    if (deleteFiles) {
+      let wsPath = null;
+      if (isCustom) {
+        wsPath = customPath;
+      } else {
+        for (const root of WORKSPACES_ROOTS) {
+          const candidate = path.resolve(root, workspace);
+          if (fs.existsSync(candidate)) {
+            wsPath = candidate;
+            break;
+          }
+        }
+      }
+
+      if (wsPath && fs.existsSync(wsPath)) {
+        const resolvedPath = path.resolve(wsPath);
+        const resolvedRoot = path.resolve(WORKSPACES_ROOT);
+        const isSelfOrParent = resolvedRoot.startsWith(resolvedPath) || resolvedPath === '/' || resolvedPath === os.homedir();
+        if (isSelfOrParent) {
+          throw new Error('Access denied: Cannot delete system or root directories');
+        }
+        await fs.promises.rm(resolvedPath, { recursive: true, force: true });
+      }
+    }
+
+    res.json({ status: 'success' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1829,8 +1886,13 @@ app.get('/api/git/status', authenticate, (req, res) => {
     const cwd = resolveWorkspacePath(workspace);
     const git = spawn('git', ['status', '--porcelain'], { cwd });
     let stdout = '';
+    let stderr = '';
     git.stdout.on('data', (data) => stdout += data.toString());
-    git.on('close', () => {
+    git.stderr.on('data', (data) => stderr += data.toString());
+    git.on('close', (code) => {
+      if (code !== 0) {
+        return res.status(500).json({ error: stderr.trim() || 'Failed to read git status (not a git repository?)' });
+      }
       const files = stdout.split('\n').filter(line => line.trim()).map(line => {
         const code = line.slice(0, 2);
         const filePath = line.slice(3).trim();
@@ -2237,6 +2299,28 @@ app.post('/api/git/discard-all', authenticate, (req, res) => {
           res.status(500).json({ error: 'Discard all failed' });
         }
       });
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Git init
+app.post('/api/git/init', authenticate, (req, res) => {
+  const { workspace } = req.body;
+  if (!workspace) return res.status(400).json({ error: 'Missing workspace' });
+
+  try {
+    const cwd = resolveWorkspacePath(workspace);
+    const git = spawn('git', ['init'], { cwd });
+    let stderr = '';
+    git.stderr.on('data', (d) => stderr += d.toString());
+    git.on('close', (code) => {
+      if (code === 0) {
+        res.json({ status: 'success', log: 'Initialized empty Git repository' });
+      } else {
+        res.status(500).json({ error: `Git init failed: ${stderr}` });
+      }
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
