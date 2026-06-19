@@ -1,12 +1,13 @@
 import express from 'express';
 import http from 'http';
+import net from 'net';
 import { WebSocketServer } from 'ws';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { spawn, exec } from 'child_process';
+import { spawn, exec, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import zlib from 'zlib';
 import pty from 'node-pty';
@@ -30,6 +31,218 @@ if (WORKSPACES_ROOTS.length === 0) {
 }
 const WORKSPACES_ROOT = WORKSPACES_ROOTS[0];
 const WORKSPACES_CONFIG_PATH = path.join(__dirname, 'workspaces.json');
+
+// ── Workspace Service Registry ────────────────────────────────────────────────
+// Tracks which ports belong to each workspace and their service type.
+// Shape: Map<workspaceName, { frontend: number|null, backend: number|null, backendPrefix: string }>
+const workspaceServices = new Map();
+
+// Tracks the most recently accessed gateway port for the fallback proxy.
+// Single-user local dev tool: one active preview session at a time.
+// This allows the fallback proxy to serve arbitrarily deep ES module import
+// chains (App.tsx → Login.tsx → Button.tsx → ...) without needing the
+// Referer header to chain back to a gateway URL.
+let lastActiveGatewayPort = null;
+
+// Detect stack type from workspace directory
+const detectWorkspaceStack = async (wsPath) => {
+  const topology = { frontend: null, backend: null, backendPrefix: '/api', stack: [] };
+  try {
+    const pkgPath = path.join(wsPath, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(await fs.promises.readFile(pkgPath, 'utf8'));
+      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      if (deps['next']) topology.stack.push('nextjs');
+      if (deps['vite']) topology.stack.push('vite');
+      if (deps['react-scripts']) topology.stack.push('cra');
+      if (deps['express']) topology.stack.push('express');
+      if (deps['fastify']) topology.stack.push('fastify');
+      if (deps['koa']) topology.stack.push('koa');
+      if (deps['hono']) topology.stack.push('hono');
+      const scripts = pkg.scripts || {};
+      const allScripts = Object.values(scripts).join(' ');
+      if (allScripts.includes('vite') && !topology.stack.includes('vite')) topology.stack.push('vite');
+      if (allScripts.includes('next') && !topology.stack.includes('nextjs')) topology.stack.push('nextjs');
+    }
+    const reqPath = path.join(wsPath, 'requirements.txt');
+    if (fs.existsSync(reqPath)) {
+      const req = await fs.promises.readFile(reqPath, 'utf8');
+      if (/fastapi/i.test(req)) topology.stack.push('fastapi');
+      if (/flask/i.test(req)) topology.stack.push('flask');
+      if (/django/i.test(req)) topology.stack.push('django');
+    }
+    const pyprojPath = path.join(wsPath, 'pyproject.toml');
+    if (fs.existsSync(pyprojPath)) {
+      const pyproj = await fs.promises.readFile(pyprojPath, 'utf8');
+      if (/fastapi/i.test(pyproj)) topology.stack.push('fastapi');
+      if (/flask/i.test(pyproj)) topology.stack.push('flask');
+    }
+    if (fs.existsSync(wsPath)) {
+      const subdirs = fs.readdirSync(wsPath, { withFileTypes: true })
+        .filter(d => d.isDirectory()).map(d => d.name);
+      topology.hasFrontendDir = subdirs.some(d => ['frontend','client','web','ui'].includes(d));
+      topology.hasBackendDir  = subdirs.some(d => ['backend','server','api','app'].includes(d));
+    }
+  } catch (err) {
+    console.error('[Gateway] Stack detection error:', err.message);
+  }
+  topology.stack = [...new Set(topology.stack)];
+  return topology;
+};
+
+// Build the gateway patcher script injected into HTML responses.
+// Transparently rewrites fetch/XHR/WebSocket calls so the browser
+// routes everything through the single gateway URL.
+const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = false) =>
+`<script>
+(function() {
+  var _workspaceName = ${JSON.stringify(workspaceName)};
+  var _currentPort   = ${currentPort};
+  var _trailingSlash = ${trailingSlash};
+  var _gwBase        = '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + _currentPort;
+
+  function rewriteUrl(urlStr, baseHref) {
+    try {
+      var u = new URL(urlStr, baseHref || location.href);
+      var rest = u.pathname + u.search + u.hash;
+
+      // ── Same-origin relative paths ────────────────────────────────────────
+      // When the page is loaded via the gateway (e.g. https://tunnel.xyz/gateway/.../port/3000/),
+      // any relative fetch like /_next/data/... or /api/... resolves to the tunnel origin.
+      // The tunnel host IS the same as location.hostname, so we detect this and reroute
+      // through the gateway prefix so it reaches the dev server instead of the gateway server.
+      if (u.hostname === location.hostname) {
+        // Already going through a gateway/preview/ws-static path — don't rewrite, but fix trailing slash if needed
+        if (rest.startsWith('/gateway/') || rest.startsWith('/preview/') || rest.startsWith('/ws-static/')) {
+          if (_trailingSlash) {
+            var pathname = u.pathname;
+            if (!pathname.endsWith('/') && !/\.[a-zA-Z0-9]+$/.test(pathname)) {
+              return location.origin + pathname + '/' + u.search + u.hash;
+            }
+          }
+          return urlStr;
+        }
+        
+        if (_trailingSlash) {
+          var pathname = u.pathname;
+          if (!pathname.endsWith('/') && !/\.[a-zA-Z0-9]+$/.test(pathname)) {
+            rest = pathname + '/' + u.search + u.hash;
+          }
+        }
+        // Everything else is an app-relative path (/_next/..., /static/..., /public/..., etc.)
+        // Reroute through the gateway so it reaches the dev server
+        return location.origin + _gwBase + rest;
+      }
+
+      // ── Explicit localhost / 127.0.0.1 URLs ──────────────────────────────
+      if (u.hostname !== 'localhost' && u.hostname !== '127.0.0.1') return urlStr;
+      var port = u.port ? parseInt(u.port) : 80;
+      
+      // If the port matches the gateway's port, check if it's a relative URL that resolved to the root origin
+      var gwPort = parseInt(location.port || (location.protocol === 'https:' ? '443' : '80'));
+      if (port === gwPort) {
+        if (!rest.startsWith('/gateway/') && !rest.startsWith('/preview/') && !rest.startsWith('/ws-static/')) {
+          if (_trailingSlash) {
+            var pathname = u.pathname;
+            if (!pathname.endsWith('/') && !/\.[a-zA-Z0-9]+$/.test(pathname)) {
+              rest = pathname + '/' + u.search + u.hash;
+            }
+          }
+          return location.origin + '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + _currentPort + rest;
+        }
+        return urlStr;
+      }
+      
+      // For any other localhost port (e.g. backend port 5000), route it through the gateway at that port
+      if (_trailingSlash) {
+        var pathname = u.pathname;
+        if (!pathname.endsWith('/') && !/\.[a-zA-Z0-9]+$/.test(pathname)) {
+          rest = pathname + '/' + u.search + u.hash;
+        }
+      }
+      return location.origin + '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + port + rest;
+    } catch(e) { return urlStr; }
+  }
+
+  // 1. Patch WebSocket (Vite HMR, Next.js, etc.)
+  var _OrigWS = window.WebSocket;
+  function PatchedWS(url, protocols) {
+    try {
+      var u = new URL(url, location.href);
+      if (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === location.hostname) {
+        var gwPort = parseInt(location.port || (location.protocol === 'https:' ? '443' : '80'));
+        var port = u.port ? parseInt(u.port) : null;
+        var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        var targetPort = (port && port !== gwPort) ? port : _currentPort;
+        // Strip any existing gateway prefix from pathname to prevent duplication
+        var pathname = u.pathname || '/';
+        var gatewayPrefix = '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + targetPort;
+        if (pathname.startsWith(gatewayPrefix)) {
+          pathname = pathname.substring(gatewayPrefix.length) || '/';
+        }
+        url = proto + '://' + location.host + '/gateway/' + encodeURIComponent(_workspaceName) + '/__ws/' + targetPort + pathname + (u.search||'');
+        console.log('[GW-WS] rewritten to:', url);
+      }
+    } catch(e) { console.log('[GW-WS] error:', e); }
+    console.log('[GW-WS] connecting:', url);
+    if (protocols !== undefined) return new _OrigWS(url, protocols);
+    return new _OrigWS(url);
+  }
+  PatchedWS.prototype = _OrigWS.prototype;
+  PatchedWS.CONNECTING = _OrigWS.CONNECTING; PatchedWS.OPEN = _OrigWS.OPEN;
+  PatchedWS.CLOSING = _OrigWS.CLOSING; PatchedWS.CLOSED = _OrigWS.CLOSED;
+  window.WebSocket = PatchedWS;
+
+  // 2. Patch fetch
+  var _origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    try {
+      var urlStr = (input instanceof Request) ? input.url : String(input);
+      var rewritten = rewriteUrl(urlStr);
+      if (rewritten !== urlStr) {
+        if (input instanceof Request) {
+          var initOpts = {};
+          var keys = ['method', 'headers', 'credentials', 'cache', 'redirect', 'referrer', 'integrity', 'keepalive', 'signal'];
+          for (var i = 0; i < keys.length; i++) {
+            var k = keys[i];
+            if (input[k] !== undefined) initOpts[k] = input[k];
+          }
+          if (input.mode !== 'navigate') {
+            initOpts.mode = input.mode;
+          }
+          if (input.method !== 'GET' && input.method !== 'HEAD') {
+            try {
+              initOpts.body = input.clone().body;
+            } catch(e) {}
+          }
+          input = new Request(rewritten, initOpts);
+        } else {
+          input = rewritten;
+        }
+      }
+    } catch(e) {
+      console.log('[GW-WS] fetch rewrite error:', e);
+    }
+    return _origFetch.call(this, input, init);
+  };
+
+  // 3. Patch XMLHttpRequest
+  var _origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    try { if (typeof url === 'string') url = rewriteUrl(url); } catch(e) {}
+    return _origOpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments, 2)));
+  };
+
+  // 4. Clean token from URL bar
+  if (window.history && window.history.replaceState) {
+    var _u = new URL(window.location.href);
+    if (_u.searchParams.has('token') || _u.searchParams.has('t')) {
+      _u.searchParams.delete('token'); _u.searchParams.delete('t');
+      window.history.replaceState({}, document.title, _u.pathname + _u.search + _u.hash);
+    }
+  }
+})();
+</script>`;
 
 const app = express();
 const server = http.createServer(app);
@@ -95,6 +308,53 @@ app.get('/api/files/preview', async (req, res) => {
   } catch (err) {
     res.status(404).send('Not found: ' + err.message);
   }
+});
+
+// Redirect navigation requests to / back to the gateway/preview if they came from it
+app.get('/', (req, res, next) => {
+  const referer = req.headers.referer;
+  if (referer && (referer.includes('/gateway/') || referer.includes('/preview/'))) {
+    const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html');
+    if (isHtmlRequest) {
+      let port = null;
+      let workspaceName = null;
+      let isPreviewMode = false;
+
+      const previewMatch = referer.match(/\/preview\/(\d+)/);
+      const gatewayMatch = referer.match(/\/gateway\/([^/]+)\/port\/(\d+)/);
+      if (previewMatch) {
+        port = parseInt(previewMatch[1], 10);
+        isPreviewMode = true;
+      } else if (gatewayMatch) {
+        workspaceName = decodeURIComponent(gatewayMatch[1]);
+        port = parseInt(gatewayMatch[2], 10);
+      }
+
+      if (!port && lastActiveGatewayPort) {
+        port = lastActiveGatewayPort;
+      }
+      if (!workspaceName && port) {
+        for (const [wsName, svcs] of workspaceServices.entries()) {
+          if (svcs.frontend === port || svcs.backend === port) {
+            workspaceName = wsName;
+            break;
+          }
+        }
+      }
+
+      if (port) {
+        let targetUrl;
+        if (isPreviewMode) {
+          targetUrl = `/preview/${port}/`;
+        } else {
+          targetUrl = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}/`;
+        }
+        console.log(`[Gateway Redirect] Redirecting root navigation from Referer: ${targetUrl}`);
+        return res.redirect(302, targetUrl);
+      }
+    }
+  }
+  next();
 });
 
 // Serve static client build if it exists
@@ -168,44 +428,474 @@ const resolveWorkspacePath = (workspaceName, subPath = '') => {
   if (!fs.existsSync(absolutePath)) {
     throw new Error(`Workspace path does not exist: ${absolutePath}`);
   }
+  
+  // Add workspace to git safe.directory to fix dubious ownership error
+  exec(`git config --global --replace-all safe.directory "${absolutePath.replace(/\\/g, '/')}"`, (err) => {
+    if (err) {
+      // Silently fail - don't block workspace access if git config fails
+      console.error(`Git safe.directory config skipped for ${absolutePath}`);
+    }
+  });
+  
   return absolutePath;
+};
+
+// Helper to forward parsed request body if consumed by express.json()
+const forwardRequestBody = (req, proxyReq) => {
+  if (req.body && (typeof req.body === 'object' && Object.keys(req.body).length > 0)) {
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('application/json')) {
+      const bodyData = JSON.stringify(req.body);
+      proxyReq.write(bodyData);
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+      const bodyData = new URLSearchParams(req.body).toString();
+      proxyReq.write(bodyData);
+    } else {
+      proxyReq.write(req.body);
+    }
+    proxyReq.end();
+  } else {
+    req.pipe(proxyReq, { end: true });
+  }
 };
 
 // --- REST Endpoints ---
 
+// ── Workspace Gateway — single URL per workspace, routes to frontend + backend ─
+// /gateway/:workspace/          → frontend port (e.g. Vite on 3000)
+// /gateway/:workspace/api/*     → backend port  (e.g. Express/Flask on 8000)
+// /gateway/:workspace/__ws/:port/* → WebSocket passthrough (HTTP upgrade handled in server.on('upgrade'))
+
+// ── SSE passthrough for Next.js HMR (/_next/webpack-hmr, /_next/eventsource) ─
+// Must be defined BEFORE the main gateway route so it takes priority.
+app.get('/gateway/:workspace/port/:port/_next/webpack-hmr', (req, res) => {
+  _gatewaySSE(req, res);
+});
+app.get('/gateway/:workspace/port/:port/_next/eventsource', (req, res) => {
+  _gatewaySSE(req, res);
+});
+function _gatewaySSE(req, res) {
+  // Auth via cookie
+  let cookieToken = null;
+  if (req.headers.cookie) {
+    const cookies = req.headers.cookie.split(';').reduce((acc, c) => {
+      const [k, v] = c.trim().split('='); acc[k] = v; return acc;
+    }, {});
+    cookieToken = cookies['portable_token'];
+  }
+  const authorized = req.query.token === SECURITY_TOKEN || cookieToken === SECURITY_TOKEN;
+  if (!authorized) { res.status(401).end('Unauthorized'); return; }
+
+  const port = parseInt(req.params.port, 10);
+  const match = req.path.match(/^\/gateway\/[^/]+\/port\/\d+(\/.*)$/);
+  const subPath = match ? match[1] : req.path;
+
+  // Prepend basePath if Next.js config contains it
+  let finalPath = subPath;
+  try {
+    const workspaceName = req.params.workspace;
+    const wsRoot = resolveWorkspacePath(workspaceName);
+    const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+      .find(f => fs.existsSync(path.join(wsRoot, f)));
+    const hasBasePath = configFile
+      && /basePath\s*:/.test(fs.readFileSync(path.join(wsRoot, configFile), 'utf8'));
+    if (hasBasePath) {
+      finalPath = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}${subPath}`;
+    }
+  } catch (e) {
+    // fallback to original subPath
+  }
+
+  // Set SSE headers — no buffering
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const options = {
+    hostname: 'localhost',
+    port,
+    path: finalPath + (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''),
+    method: 'GET',
+    headers: {
+      ...req.headers,
+      host: `localhost:${port}`,
+      accept: 'text/event-stream',
+    },
+  };
+  delete options.headers['authorization'];
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    proxyRes.pipe(res, { end: true });
+  });
+  proxyReq.on('error', () => res.end());
+  req.on('close', () => proxyReq.destroy());
+  proxyReq.end();
+}
+
+// ── Auto-patch next.config.js with basePath + assetPrefix ────────────────────
+// POST /api/workspaces/patch-nextconfig  { workspace, port }
+app.post('/api/workspaces/patch-nextconfig', authenticate, async (req, res) => {
+  const { workspace, port } = req.body;
+  if (!workspace || !port) return res.status(400).json({ error: 'Missing workspace or port' });
+  try {
+    const wsRoot = resolveWorkspacePath(workspace);
+    const gwBase = `/gateway/${encodeURIComponent(workspace)}/port/${port}`;
+    // Find next.config file (js, mjs, ts)
+    const candidates = ['next.config.mjs', 'next.config.js', 'next.config.ts', 'next.config.cjs'];
+    let configPath = null;
+    for (const c of candidates) {
+      const p = path.join(wsRoot, c);
+      if (fs.existsSync(p)) { configPath = p; break; }
+    }
+    if (!configPath) {
+      // Create a minimal one
+      configPath = path.join(wsRoot, 'next.config.mjs');
+      await fs.promises.writeFile(configPath,
+        `const nextConfig = {\n  basePath: '${gwBase}',\n  assetPrefix: '${gwBase}',\n};\nexport default nextConfig;\n`
+      );
+      return res.json({ status: 'created', file: 'next.config.mjs', gwBase });
+    }
+    let content = await fs.promises.readFile(configPath, 'utf8');
+    // Remove existing basePath / assetPrefix lines
+    content = content
+      .replace(/^\s*basePath\s*:.*,?\n?/gm, '')
+      .replace(/^\s*assetPrefix\s*:.*,?\n?/gm, '');
+    // Inject before the closing of the config object — handles both JS and TS type annotations
+    content = content.replace(
+      /(const|let|var)\s+nextConfig\s*(?::\s*\w+\s*)?\s*=\s*\{/,
+      `$1 nextConfig: NextConfig = {\n  basePath: '${gwBase}',\n  assetPrefix: '${gwBase}',`
+    );
+    await fs.promises.writeFile(configPath, content, 'utf8');
+    res.json({ status: 'patched', file: path.basename(configPath), gwBase });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Port-Isolated Workspace Gateway Routing ──────────────────────────────
+app.all('/gateway/:workspace/port/:port*', async (req, res) => {
+  // Auth: cookie or ?token=
+  let cookieToken = null;
+  if (req.headers.cookie) {
+    const cookies = req.headers.cookie.split(';').reduce((acc, c) => {
+      const [k, v] = c.trim().split('='); acc[k] = v; return acc;
+    }, {});
+    cookieToken = cookies['portable_token'];
+  }
+  const tokenParam = req.query.token;
+  const authorized = tokenParam === SECURITY_TOKEN || cookieToken === SECURITY_TOKEN;
+  if (!authorized) return res.status(401).send('Unauthorized');
+
+  if (tokenParam === SECURITY_TOKEN) {
+    res.setHeader('Set-Cookie', `portable_token=${tokenParam}; Path=/; HttpOnly; SameSite=Lax`);
+  }
+
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', req.headers['origin'] || '*');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || 'Content-Type, Authorization, Cookie');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    return res.status(204).end();
+  }
+
+  const workspaceName = req.params.workspace;
+
+  // Use regex to parse port and subPath accurately
+  const match = req.path.match(/^\/gateway\/([^/]+)\/port\/(\d+)(.*)$/);
+  if (!match) {
+    return res.status(400).send('Invalid gateway URL');
+  }
+  const port = parseInt(match[2], 10);
+  const subPath = match[3] || '/';
+
+  if (!port || port < 1024 || port > 65535) {
+    return res.status(400).send('Invalid port');
+  }
+
+  // Only update lastActiveGatewayPort if it's not a backend API request
+  const services = workspaceServices.get(workspaceName);
+  const isBackend = services && (services.backend === port || subPath.startsWith(services.backendPrefix || '/api'));
+  if (!isBackend) {
+    lastActiveGatewayPort = port;
+  }
+
+  // Redirect if missing trailing slash so relative paths resolve correctly
+  if (req.path === `/gateway/${encodeURIComponent(workspaceName)}/port/${port}`) {
+    const qs = req.url.slice(req.path.length);
+    return res.redirect(301, `/gateway/${encodeURIComponent(workspaceName)}/port/${port}/${qs}`);
+  }
+
+  // Base path of the gateway for this specific port
+  const gwBase = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}`;
+
+  // Check if Next.js config contains trailingSlash: true
+  let trailingSlash = false;
+  try {
+    const wsRoot = resolveWorkspacePath(workspaceName);
+    const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+      .find(f => fs.existsSync(path.join(wsRoot, f)));
+    if (configFile) {
+      const content = fs.readFileSync(path.join(wsRoot, configFile), 'utf8');
+      trailingSlash = /trailingSlash\s*:\s*true/.test(content);
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  // Build the client patcher script to inject
+  const patcherScript = buildGatewayPatcherScript(workspaceName, port, trailingSlash);
+
+  // Strip query token before forwarding
+  const forwardQuery = { ...req.query };
+  delete forwardQuery.token;
+  delete forwardQuery.t;
+  const qs = new URLSearchParams(forwardQuery).toString();
+
+  // Forward the full path including gateway prefix when basePath is set in next.config
+  // so Next.js can match its own basePath-prefixed routes correctly.
+  let fullTargetPath;
+  try {
+    const wsRoot = resolveWorkspacePath(workspaceName);
+    const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+      .find(f => fs.existsSync(path.join(wsRoot, f)));
+    const hasBasePath = configFile
+      && /basePath\s*:/.test(fs.readFileSync(path.join(wsRoot, configFile), 'utf8'));
+    fullTargetPath = hasBasePath
+      ? (gwBase + (subPath === '/' ? '/' : subPath) + (qs ? `?${qs}` : ''))
+      : (subPath + (qs ? `?${qs}` : ''));
+  } catch {
+    fullTargetPath = subPath + (qs ? `?${qs}` : '');
+  }
+
+  const proxyHeaders = {
+    ...req.headers,
+    host: `localhost:${port}`,
+    'accept-encoding': 'gzip, deflate',
+  };
+  delete proxyHeaders['authorization'];
+
+  if (req.body && (typeof req.body === 'object' && Object.keys(req.body).length > 0)) {
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('application/json')) {
+      const bodyData = JSON.stringify(req.body);
+      proxyHeaders['content-length'] = Buffer.byteLength(bodyData);
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+      const bodyData = new URLSearchParams(req.body).toString();
+      proxyHeaders['content-length'] = Buffer.byteLength(bodyData);
+    }
+  }
+
+  const proxyOptions = {
+    hostname: 'localhost',
+    port: port,
+    path: fullTargetPath || '/',
+    method: req.method,
+    headers: proxyHeaders,
+  };
+
+  const proxyReq = http.request(proxyOptions, (proxyRes) => {
+    const contentType = proxyRes.headers['content-type'] || '';
+    const encoding = proxyRes.headers['content-encoding'] || '';
+    const isHtml = contentType.includes('text/html');
+    console.log(`[Gateway Proxy] ${req.method} ${fullTargetPath} → ${proxyRes.statusCode} ct="${contentType}" enc="${encoding}" isHtml=${isHtml}`);
+
+    const outHeaders = { ...proxyRes.headers };
+    // Strip embedding-blocking headers
+    delete outHeaders['x-frame-options'];
+    delete outHeaders['content-security-policy'];
+    delete outHeaders['content-security-policy-report-only'];
+
+    // Rewrite redirect locations to stay within this port's gateway
+    if (outHeaders.location) {
+      const loc = outHeaders.location;
+      const locNorm = loc.replace(/\/$/, '');
+      const reqNorm = req.path.replace(/\/$/, '');
+      // Trailing-slash loop: Next.js redirects /gwBase/ → /gwBase endlessly.
+      // Break it by stripping the trailing slash from the location so the
+      // browser lands on /gwBase which our proxy already handles without redirect.
+      if (locNorm === reqNorm && reqNorm === gwBase) {
+        // They're the same path — just remove trailing slash from location
+        outHeaders.location = loc.endsWith('/') ? loc.slice(0, -1) : loc + '/';
+      } else if (loc.startsWith('/') && !loc.startsWith(gwBase)) {
+        outHeaders.location = gwBase + loc;
+      } else {
+        outHeaders.location = loc.replace(/^https?:\/\/localhost:\d+/, '');
+      }
+    }
+
+    if (isHtml) {
+      delete outHeaders['content-encoding'];
+      delete outHeaders['content-length'];
+
+      let stream = proxyRes;
+      if (encoding === 'gzip')         stream = proxyRes.pipe(zlib.createGunzip());
+      else if (encoding === 'deflate')  stream = proxyRes.pipe(zlib.createInflate());
+      else if (encoding === 'br')       stream = proxyRes.pipe(zlib.createBrotliDecompress());
+
+      let body = '';
+      stream.setEncoding('utf8');
+      stream.on('data', chunk => { body += chunk; });
+      stream.on('end', () => {
+        // ── Strip CSP meta tag entirely (nonces are per-tag, can't be reused) ──
+        let rewritten = body.replace(/<meta[^>]+Content-Security-Policy[^>]*>/gi, '');
+
+        // Rewrite absolute asset paths
+        rewritten = rewritten
+          .replace(/https?:\/\/localhost:\d+\/(?!gateway\/|preview\/|ws\/|api\/)/g, `${gwBase}/`)
+          .replace(/(src|href|action)="\/(?!\/|gateway\/|preview\/)/g, `$1="${gwBase}/`)
+          .replace(/(src|href|action)='\/(?!\/|gateway\/|preview\/)/g,  `$1='${gwBase}/`)
+          .replace(/url\(\/(?!\/|gateway\/|preview\/)/g,                `url(${gwBase}/`)
+          .replace(/from\s+"\/(?!\/|gateway\/|preview\/)/g, `from "${gwBase}/`)
+          .replace(/from\s+'\/(?!\/|gateway\/|preview\/)/g, `from '${gwBase}/`)
+          .replace(/import\s+"\/(?!\/|gateway\/|preview\/)/g, `import "${gwBase}/`)
+          .replace(/import\s+'\/(?!\/|gateway\/|preview\/)/g, `import '${gwBase}/`);
+
+        // ── Inject patcher after <meta charset> with no nonce needed (CSP stripped) ──
+        const charsetMeta = rewritten.match(/<meta[^>]+charset[^>]*>/i);
+        if (charsetMeta) {
+          rewritten = rewritten.replace(charsetMeta[0], `${charsetMeta[0]}${patcherScript}`);
+        } else if (rewritten.includes('<head>')) {
+          rewritten = rewritten.replace('<head>', `<head>${patcherScript}`);
+        } else if (rewritten.includes('</head>')) {
+          rewritten = rewritten.replace('</head>', `${patcherScript}</head>`);
+        } else {
+          rewritten = patcherScript + rewritten;
+        }
+
+        outHeaders['content-length'] = Buffer.byteLength(rewritten, 'utf8');
+        res.writeHead(proxyRes.statusCode, outHeaders);
+        res.end(rewritten, 'utf8');
+      });
+      stream.on('error', () => {
+        if (!res.headersSent) res.status(502).send('Decompression error');
+      });
+    } else {
+      // Non-HTML content: pass through with fixed CORS headers
+      outHeaders['access-control-allow-origin'] = req.headers['origin'] || '*';
+      if (req.headers['origin']) {
+        outHeaders['access-control-allow-credentials'] = 'true';
+        outHeaders['vary'] = (outHeaders['vary'] ? outHeaders['vary'] + ', ' : '') + 'Origin';
+      }
+      outHeaders['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
+      outHeaders['access-control-allow-headers'] = req.headers['access-control-request-headers'] || 'Content-Type, Authorization';
+
+      // Fix missing MIME types
+      const requestPath = subPath || '/';
+      const ext = path.extname(requestPath).toLowerCase();
+      if (ext === '.css' && !outHeaders['content-type']) {
+        outHeaders['content-type'] = 'text/css; charset=utf-8';
+      } else if (ext === '.js' && !outHeaders['content-type']) {
+        outHeaders['content-type'] = 'application/javascript; charset=utf-8';
+      }
+
+      res.writeHead(proxyRes.statusCode, outHeaders);
+      proxyRes.pipe(res, { end: true });
+    }
+  });
+
+  proxyReq.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(502).type('html').send(`
+        <html><body style="background:#0a0a0a;color:#e5e7eb;font-family:monospace;padding:40px;max-width:600px;margin:auto">
+          <h2 style="color:#f87171">⚡ Port unreachable</h2>
+          <p>Cannot connect to <strong style="color:#fff">localhost:${port}</strong></p>
+          <p style="color:#9ca3af">Is the dev server running on port ${port}? Check your terminal tab.</p>
+          <pre style="background:#111;border:1px solid #333;padding:12px;border-radius:8px;color:#f87171;margin-top:8px">${err.message}</pre>
+        </body></html>`);
+    }
+  });
+
+  forwardRequestBody(req, proxyReq);
+});
+
 // ── Live port proxy — forwards /preview/<port>/* to localhost:<port> ─────────
 // Used by PreviewTab to embed running dev servers in an iframe
 app.all('/preview/:port*', (req, res) => {
-  const tokenParam = req.query.token;
-  if (tokenParam !== SECURITY_TOKEN) {
+  let tokenParam = req.query.token;
+  
+  // Parse cookies manually
+  let cookieToken = null;
+  if (req.headers.cookie) {
+    const cookies = req.headers.cookie.split(';').reduce((acc, c) => {
+      const [k, v] = c.trim().split('=');
+      acc[k] = v;
+      return acc;
+    }, {});
+    cookieToken = cookies['portable_token'];
+  }
+
+  const authorized = tokenParam === SECURITY_TOKEN || cookieToken === SECURITY_TOKEN;
+  if (!authorized) {
     return res.status(401).send('Unauthorized');
+  }
+
+  // Set cookie if token was passed in query to establish session
+  if (tokenParam === SECURITY_TOKEN) {
+    res.setHeader('Set-Cookie', `portable_token=${tokenParam}; Path=/; HttpOnly; SameSite=Lax`);
   }
 
   const port = parseInt(req.params.port, 10);
   if (!port || port < 1024 || port > 65535) {
     return res.status(400).send('Invalid port');
   }
+  
+  const subPath = req.params[0] || '/';
+  if (port !== 8080 && !subPath.startsWith('/api')) {
+    lastActiveGatewayPort = port;
+  }
+
+  // Handle CORS preflight — browsers send this before every cross-origin API call
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', req.headers['origin'] || '*');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || 'Content-Type, Authorization, Cookie');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    return res.status(204).end();
+  }
 
   // Build target path — strip /preview/<port> prefix and our token params
   const suffix = req.params[0] || '/';
   const urlObj = new URL(`http://localhost${suffix || '/'}`);
+  
+  // Forward original query parameters
+  for (const [key, val] of Object.entries(req.query)) {
+    urlObj.searchParams.set(key, val);
+  }
+  
   urlObj.searchParams.delete('token');
   urlObj.searchParams.delete('t');
   const targetPath = (urlObj.pathname || '/') + (urlObj.search || '');
+
+  const proxyHeaders = {
+    ...req.headers,
+    host: `localhost:${port}`,
+    // Accept both compressed and plain — we'll handle decompression ourselves
+    'accept-encoding': 'gzip, deflate',
+  };
+  delete proxyHeaders['authorization'];
+
+  if (req.body && (typeof req.body === 'object' && Object.keys(req.body).length > 0)) {
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('application/json')) {
+      const bodyData = JSON.stringify(req.body);
+      proxyHeaders['content-length'] = Buffer.byteLength(bodyData);
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+      const bodyData = new URLSearchParams(req.body).toString();
+      proxyHeaders['content-length'] = Buffer.byteLength(bodyData);
+    }
+  }
 
   const options = {
     hostname: 'localhost',
     port,
     path: targetPath,
     method: req.method,
-    headers: {
-      ...req.headers,
-      host: `localhost:${port}`,
-      // Accept both compressed and plain — we'll handle decompression ourselves
-      'accept-encoding': 'gzip, deflate',
-    },
+    headers: proxyHeaders,
   };
-  delete options.headers['authorization'];
 
   const proxyReq = http.request(options, (proxyRes) => {
     const contentType = proxyRes.headers['content-type'] || '';
@@ -247,10 +937,96 @@ app.all('/preview/:port*', (req, res) => {
       stream.on('data', chunk => { body += chunk; });
       stream.on('end', () => {
         // Rewrite absolute asset paths so they route through the proxy
-        const rewritten = body
-          .replace(/(src|href|action)="\//g,   `$1="/preview/${port}/`)
-          .replace(/(src|href|action)='\//g,   `$1='/preview/${port}/`)
-          .replace(/url\(\//g,                  `url(/preview/${port}/`);
+        let rewritten = body
+          .replace(/(src|href|action)="\/(?!\/)/g, `$1="/preview/${port}/`)
+          .replace(/(src|href|action)='\/(?!\/)/g,  `$1='/preview/${port}/`)
+          .replace(/url\(\/(?!\/)/g,                `url(/preview/${port}/`);
+
+        // ── Proxy Patcher Script ─────────────────────────────────────────────
+        // Injected before any app code runs. Transparently routes:
+        //   • WebSocket connections (Vite HMR, webpack-dev-server) → /preview/:port/...
+        //   • fetch() calls to localhost:port → /preview/:port/...
+        //   • XMLHttpRequest calls to localhost:port → /preview/:port/...
+        // Zero changes required in any project.
+        const scriptToInject = `<script>
+(function() {
+  var _proxyPort = ${port};
+
+  // 1. Patch WebSocket — redirect HMR and dev-server sockets through proxy
+  var _OrigWS = window.WebSocket;
+  function PatchedWS(url, protocols) {
+    try {
+      var u = new URL(url, location.href);
+      // Redirect any localhost:port WS or any WS to current host root
+      var targetPort = u.port ? parseInt(u.port) : (u.hostname === location.hostname ? _proxyPort : null);
+      if (targetPort && (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === location.hostname)) {
+        var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        url = proto + '://' + location.host + '/preview/' + targetPort + (u.pathname || '/') + (u.search || '');
+      }
+    } catch(e) {}
+    if (protocols !== undefined) return new _OrigWS(url, protocols);
+    return new _OrigWS(url);
+  }
+  PatchedWS.prototype = _OrigWS.prototype;
+  PatchedWS.CONNECTING = _OrigWS.CONNECTING;
+  PatchedWS.OPEN = _OrigWS.OPEN;
+  PatchedWS.CLOSING = _OrigWS.CLOSING;
+  PatchedWS.CLOSED = _OrigWS.CLOSED;
+  window.WebSocket = PatchedWS;
+
+  // 2. Patch fetch — redirect localhost API calls through proxy
+  var _origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    try {
+      var urlStr = (input instanceof Request) ? input.url : input;
+      if (typeof urlStr === 'string') {
+        var u = new URL(urlStr);
+        if ((u.hostname === 'localhost' || u.hostname === '127.0.0.1') && u.port) {
+          var newUrl = location.origin + '/preview/' + u.port + u.pathname + u.search + u.hash;
+          input = (input instanceof Request) ? new Request(newUrl, input) : newUrl;
+        }
+      }
+    } catch(e) {}
+    return _origFetch.call(this, input, init);
+  };
+
+  // 3. Patch XMLHttpRequest — same redirect
+  var _origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    try {
+      if (typeof url === 'string') {
+        var u = new URL(url, location.href);
+        if ((u.hostname === 'localhost' || u.hostname === '127.0.0.1') && u.port) {
+          url = location.origin + '/preview/' + u.port + u.pathname + u.search + u.hash;
+        }
+      }
+    } catch(e) {}
+    return _origOpen.apply(this, arguments);
+  };
+
+  // 4. Clean token/timestamp from URL bar
+  if (window.history && window.history.replaceState) {
+    var url = new URL(window.location.href);
+    if (url.searchParams.has('token') || url.searchParams.has('t')) {
+      url.searchParams.delete('token');
+      url.searchParams.delete('t');
+      window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
+    }
+  }
+})();
+</script>`;
+
+        // Inject as the very first thing inside <head> so it runs before any app JS
+        if (rewritten.includes('<head>')) {
+          rewritten = rewritten.replace('<head>', `<head>${scriptToInject}`);
+        } else if (rewritten.includes('</head>')) {
+          rewritten = rewritten.replace('</head>', `${scriptToInject}</head>`);
+        } else if (rewritten.includes('</body>')) {
+          rewritten = rewritten.replace('</body>', `${scriptToInject}</body>`);
+        } else {
+          rewritten = scriptToInject + rewritten;
+        }
+
         outHeaders['content-length'] = Buffer.byteLength(rewritten, 'utf8');
         res.writeHead(proxyRes.statusCode, outHeaders);
         res.end(rewritten, 'utf8');
@@ -259,7 +1035,26 @@ app.all('/preview/:port*', (req, res) => {
         if (!res.headersSent) res.status(502).send('Decompression error');
       });
     } else {
-      // Non-HTML: pass through as-is (images, JS, CSS etc.)
+      // Non-HTML: pass through (images, JS, CSS etc.)
+      // Fix CORS headers so browser accepts API responses from the proxied backend
+      outHeaders['access-control-allow-origin'] = req.headers['origin'] || '*';
+      if (req.headers['origin']) {
+        outHeaders['access-control-allow-credentials'] = 'true';
+        outHeaders['vary'] = (outHeaders['vary'] ? outHeaders['vary'] + ', ' : '') + 'Origin';
+      }
+      outHeaders['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
+      outHeaders['access-control-allow-headers'] = req.headers['access-control-request-headers'] || 'Content-Type, Authorization';
+
+      // Ensure proper MIME types
+      const requestPath = suffix || '/';
+      const ext = path.extname(requestPath).toLowerCase();
+      
+      if (ext === '.css' && !outHeaders['content-type']) {
+        outHeaders['content-type'] = 'text/css; charset=utf-8';
+      } else if (ext === '.js' && !outHeaders['content-type']) {
+        outHeaders['content-type'] = 'application/javascript; charset=utf-8';
+      }
+      
       res.writeHead(proxyRes.statusCode, outHeaders);
       proxyRes.pipe(res, { end: true });
     }
@@ -271,7 +1066,7 @@ app.all('/preview/:port*', (req, res) => {
     }
   });
 
-  req.pipe(proxyReq, { end: true });
+  forwardRequestBody(req, proxyReq);
 });
 
 // Check authentication
@@ -519,6 +1314,140 @@ app.post('/api/workspaces/register', authenticate, async (req, res) => {
   }
 });
 
+// Register service ports for a workspace (frontend + backend + backendPrefix)
+app.post('/api/workspaces/register-service', authenticate, (req, res) => {
+  const { workspace, frontend, backend, backendPrefix } = req.body;
+  if (!workspace) return res.status(400).json({ error: 'Missing workspace' });
+
+  const existing = workspaceServices.get(workspace) || { frontend: null, backend: null, backendPrefix: '/api' };
+  const updated = {
+    frontend: frontend !== undefined ? (frontend ? parseInt(frontend, 10) : null) : existing.frontend,
+    backend:  backend  !== undefined ? (backend  ? parseInt(backend,  10) : null) : existing.backend,
+    backendPrefix: backendPrefix || existing.backendPrefix || '/api',
+  };
+  workspaceServices.set(workspace, updated);
+  console.log(`[Gateway] Registered services for ${workspace}:`, updated);
+  const gwUrl = `/gateway/${encodeURIComponent(workspace)}/port/${updated.frontend || updated.backend || '3000'}/`;
+  res.json({ status: 'ok', workspace, services: updated, gateway: gwUrl });
+});
+
+// Query workspace topology: detected stack + registered ports + gateway URL
+app.get('/api/workspaces/topology', authenticate, async (req, res) => {
+  const { workspace } = req.query;
+  if (!workspace) return res.status(400).json({ error: 'Missing workspace' });
+
+  let wsPath = '';
+  const customs = getCustomWorkspaces();
+  if (customs[workspace]) {
+    wsPath = customs[workspace];
+  } else {
+    for (const root of WORKSPACES_ROOTS) {
+      const checkPath = path.join(root, workspace);
+      if (fs.existsSync(checkPath)) { wsPath = checkPath; break; }
+    }
+  }
+
+  const stackInfo = wsPath ? await detectWorkspaceStack(wsPath) : { stack: [] };
+  const registered = workspaceServices.get(workspace) || { frontend: null, backend: null, backendPrefix: '/api' };
+  const frontendPort = registered.frontend || (registered.backend ? registered.backend : '3000');
+  const gwUrl = `/gateway/${encodeURIComponent(workspace)}/port/${frontendPort}/`;
+
+  res.json({
+    workspace,
+    wsPath: wsPath ? path.resolve(wsPath) : '',
+    gateway: gwUrl,
+    services: registered,
+    stack: stackInfo.stack,
+    hasFrontendDir: stackInfo.hasFrontendDir || false,
+    hasBackendDir: stackInfo.hasBackendDir || false,
+  });
+});
+
+// Detect the active port for a workspace by scanning processes
+app.get('/api/workspaces/detect-port', authenticate, async (req, res) => {
+  const { workspace } = req.query;
+  if (!workspace) {
+    return res.status(400).json({ error: 'Workspace is required' });
+  }
+
+  // Find the workspace path
+  let wsPath = '';
+  const customs = getCustomWorkspaces();
+  if (customs[workspace]) {
+    wsPath = customs[workspace];
+  } else {
+    for (const root of WORKSPACES_ROOTS) {
+      const checkPath = path.join(root, workspace);
+      if (fs.existsSync(checkPath)) {
+        wsPath = checkPath;
+        break;
+      }
+    }
+  }
+
+  if (!wsPath) {
+    return res.json({ port: null });
+  }
+
+  const normalizedWsPath = wsPath.replace(/\\/g, '/').toLowerCase();
+
+  try {
+    if (process.platform === 'win32') {
+      const cmd = `powershell -NoProfile -Command "Get-NetTCPConnection -State Listen | ForEach-Object { $proc = Get-CimInstance Win32_Process -Filter \\"ProcessId = $($_.OwningProcess)\\" -ErrorAction SilentlyContinue; if ($proc) { [PSCustomObject]@{ Port = $_.LocalPort; Path = $proc.ExecutablePath; Cmd = $proc.CommandLine } } } | ConvertTo-Json"`;
+      exec(cmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error('Error detecting port:', error);
+          return res.json({ port: null });
+        }
+        try {
+          let processes = JSON.parse(stdout);
+          if (!Array.isArray(processes)) {
+            processes = processes ? [processes] : [];
+          }
+          
+          const matches = processes.filter(p => {
+            const pathMatch = p.Path && p.Path.replace(/\\/g, '/').toLowerCase().includes(normalizedWsPath);
+            const cmdMatch = p.Cmd && p.Cmd.replace(/\\/g, '/').toLowerCase().includes(normalizedWsPath);
+            return (pathMatch || cmdMatch) && Number(p.Port) !== Number(PORT);
+          });
+
+          if (matches.length > 0) {
+            matches.sort((a, b) => a.Port - b.Port);
+            const detectedPorts = matches.map(m => Number(m.Port));
+
+            // Auto-register ports into the gateway service registry
+            // Heuristic: ports < 6000 are usually frontend (3000, 5173)
+            //            ports >= 6000 are usually backend (8000, 8080, etc.)
+            const existing = workspaceServices.get(workspace) || {};
+            if (!existing.frontend && detectedPorts.length >= 1) {
+              const frontendCandidates = detectedPorts.filter(p => p < 6000);
+              const backendCandidates  = detectedPorts.filter(p => p >= 6000);
+              const newSvc = {
+                frontend: frontendCandidates[0] || detectedPorts[0],
+                backend:  backendCandidates[0]  || (detectedPorts.length > 1 ? detectedPorts[1] : null),
+                backendPrefix: existing.backendPrefix || '/api',
+              };
+              workspaceServices.set(workspace, newSvc);
+              console.log(`[Gateway] Auto-registered ports for ${workspace}:`, newSvc);
+            }
+
+            const topology = workspaceServices.get(workspace) || null;
+            const gateway  = topology ? `/gateway/${encodeURIComponent(workspace)}/port/${topology.frontend || '3000'}/` : null;
+            return res.json({ port: detectedPorts[0], ports: detectedPorts, topology, gateway });
+          }
+        } catch (e) {
+          console.error('Error parsing process JSON:', e);
+        }
+        res.json({ port: null, ports: [], topology: null, gateway: null });
+      });
+    } else {
+      res.json({ port: null });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GitHub repos list
 app.get('/api/github/repos', authenticate, async (req, res) => {
   const token = process.env.GITHUB_TOKEN;
@@ -630,6 +1559,52 @@ app.post('/api/workspaces/create', authenticate, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Kill ports occupied by workspace services
+app.post('/api/workspaces/kill-ports', authenticate, async (req, res) => {
+  const { workspace, ports } = req.body;
+  if (!ports || !Array.isArray(ports)) {
+    return res.status(400).json({ error: 'Missing ports array' });
+  }
+
+  const results = [];
+  for (const portStr of ports) {
+    const port = parseInt(portStr, 10);
+    if (!port || port < 1024 || port > 65535) continue;
+
+    try {
+      if (process.platform === 'win32') {
+        const stdout = execSync(`netstat -ano`).toString();
+        const lines = stdout.split('\n');
+        const pids = new Set();
+        for (const line of lines) {
+          if (line.includes(`:${port}`) && line.includes('LISTENING')) {
+            const parts = line.trim().split(/\s+/);
+            const pid = parts[parts.length - 1];
+            if (pid && !isNaN(pid) && pid !== '0') {
+              pids.add(parseInt(pid, 10));
+            }
+          }
+        }
+        for (const pid of pids) {
+          console.log(`[Host Daemon] Killing PID ${pid} holding port ${port}...`);
+          try {
+            execSync(`taskkill /F /PID ${pid}`);
+          } catch (e) {}
+        }
+      } else {
+        try {
+          execSync(`lsof -t -i:${port} | xargs kill -9`);
+        } catch (e) {}
+      }
+      results.push({ port, status: 'freed' });
+    } catch (err) {
+      results.push({ port, status: 'error', error: err.message });
+    }
+  }
+
+  res.json({ status: 'success', results });
 });
 
 // File tree list
@@ -1115,29 +2090,43 @@ app.post('/api/git/commit', authenticate, (req, res) => {
   try {
     const cwd = resolveWorkspacePath(workspace);
     
-    // Step 1: Add files
-    const addArgs = files && files.length > 0 ? ['add', ...files] : ['add', '.'];
-    const gitAdd = spawn('git', addArgs, { cwd });
+    // Step 1: Check if remote exists before attempting push
+    const gitRemote = spawn('git', ['remote', '-v'], { cwd });
+    let remoteOutput = '';
+    gitRemote.stdout.on('data', (data) => remoteOutput += data.toString());
     
-    gitAdd.on('close', (addCode) => {
-      if (addCode !== 0) return res.status(500).json({ error: 'Git add failed' });
+    gitRemote.on('close', (remoteCode) => {
+      const hasRemote = remoteOutput.trim().length > 0;
       
-      // Step 2: Commit
-      const gitCommit = spawn('git', ['commit', '-m', message], { cwd });
+      // Step 2: Add files
+      const addArgs = files && files.length > 0 ? ['add', ...files] : ['add', '.'];
+      const gitAdd = spawn('git', addArgs, { cwd });
       
-      gitCommit.on('close', (commitCode) => {
-        // If git commit fails (e.g. nothing to commit), we still try to push or return success
-        // Step 3: Push
-        const gitPush = spawn('git', ['push'], { cwd });
-        let pushStderr = '';
-        gitPush.stderr.on('data', (data) => pushStderr += data.toString());
+      gitAdd.on('close', (addCode) => {
+        if (addCode !== 0) return res.status(500).json({ error: 'Git add failed' });
         
-        gitPush.on('close', (pushCode) => {
-          if (pushCode === 0) {
-            res.json({ status: 'success', log: 'Committed and pushed successfully' });
-          } else {
-            res.status(500).json({ error: `Push failed: ${pushStderr}` });
+        // Step 3: Commit
+        const gitCommit = spawn('git', ['commit', '-m', message], { cwd });
+        
+        gitCommit.on('close', (commitCode) => {
+          // If git commit fails (e.g. nothing to commit), we still try to push or return success
+          if (!hasRemote) {
+            // No remote configured - commit succeeded but can't push
+            return res.json({ status: 'success', log: 'Committed successfully (no remote configured - use "git remote add" to enable pushing)' });
           }
+          
+          // Step 4: Push
+          const gitPush = spawn('git', ['push'], { cwd });
+          let pushStderr = '';
+          gitPush.stderr.on('data', (data) => pushStderr += data.toString());
+          
+          gitPush.on('close', (pushCode) => {
+            if (pushCode === 0) {
+              res.json({ status: 'success', log: 'Committed and pushed successfully' });
+            } else {
+              res.status(500).json({ error: `Push failed: ${pushStderr}` });
+            }
+          });
         });
       });
     });
@@ -1254,41 +2243,288 @@ app.post('/api/git/discard-all', authenticate, (req, res) => {
   }
 });
 
-// --- Dynamic Preview Proxy ---
-// Relays requests on the server (like asset fetching/AJAX requests from phone) to local port
-app.all('/preview/:port/*', async (req, res) => {
-  const { port } = req.params;
-  const targetPath = req.params[0] || '';
-  const queryString = req.url.split('?')[1] || '';
-  const targetUrl = `http://localhost:${port}/${targetPath}${queryString ? '?' + queryString : ''}`;
+// Git GitHub Auth Helper
+app.post('/api/git/github-auth', authenticate, (req, res) => {
+  const { workspace } = req.body;
+  if (!workspace) return res.status(400).json({ error: 'Missing workspace' });
+  const username = process.env.GITHUB_USERNAME;
+  const token = process.env.GITHUB_TOKEN;
+  if (!username || !token) {
+    return res.status(400).json({ error: 'GITHUB_USERNAME and GITHUB_TOKEN are not configured in .env' });
+  }
 
   try {
-    const parsedUrl = new URL(targetUrl);
-    const options = {
-      hostname: parsedUrl.hostname,
-      port: parsedUrl.port,
-      path: parsedUrl.pathname + parsedUrl.search,
-      method: req.method,
-      headers: { ...req.headers },
-    };
-    
-    // Clean up proxy headers to avoid loops
-    delete options.headers.host;
-    delete options.headers.referer;
+    const cwd = resolveWorkspacePath(workspace);
+    const gitRemote = spawn('git', ['remote', 'get-url', 'origin'], { cwd });
+    let output = '';
+    gitRemote.stdout.on('data', (d) => output += d.toString());
+    gitRemote.on('close', (code) => {
+      if (code !== 0) {
+        return res.status(500).json({ error: 'Failed to retrieve git remote. Is this a git repository?' });
+      }
+      let url = output.trim();
+      let repoPath = '';
+      
+      if (url.startsWith('git@github.com:')) {
+        repoPath = url.replace('git@github.com:', '');
+      } else if (url.startsWith('https://github.com/')) {
+        repoPath = url.replace('https://github.com/', '');
+      } else {
+        const match = url.match(/github\.com[/:](.*)$/);
+        if (match) {
+          repoPath = match[1];
+        }
+      }
 
-    const proxyReq = http.request(options, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res, { end: true });
+      if (!repoPath) {
+        return res.status(400).json({ error: `Unsupported git remote URL format: ${url}` });
+      }
+
+      repoPath = repoPath.replace(/^[^/]+@/, '');
+
+      const authUrl = `https://${username}:${token}@github.com/${repoPath}`;
+      const gitSetUrl = spawn('git', ['remote', 'set-url', 'origin', authUrl], { cwd });
+      gitSetUrl.on('close', (setCode) => {
+        if (setCode === 0) {
+          res.json({ status: 'success', authenticatedUrl: `https://github.com/${repoPath}`, log: 'GitHub credentials successfully linked to local repository.' });
+        } else {
+          res.status(500).json({ error: 'Failed to update remote URL.' });
+        }
+      });
     });
-
-    proxyReq.on('error', (err) => {
-      res.status(502).send(`Proxy error: ${err.message}`);
-    });
-
-    req.pipe(proxyReq, { end: true });
   } catch (err) {
-    res.status(500).send(`Proxy controller error: ${err.message}`);
+    res.status(500).json({ error: err.message });
   }
+});
+
+// Git Add All (git add .)
+app.post('/api/git/add-all', authenticate, (req, res) => {
+  const { workspace } = req.body;
+  if (!workspace) return res.status(400).json({ error: 'Missing workspace' });
+
+  try {
+    const cwd = resolveWorkspacePath(workspace);
+    const gitAdd = spawn('git', ['add', '.'], { cwd });
+    gitAdd.on('close', (code) => {
+      if (code === 0) {
+        res.json({ status: 'success', log: 'Staged all changes successfully (git add .)' });
+      } else {
+        res.status(500).json({ error: 'Failed to stage changes.' });
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Git list branches
+app.get('/api/git/branches', authenticate, (req, res) => {
+  const { workspace } = req.query;
+  if (!workspace) return res.status(400).json({ error: 'Missing workspace' });
+
+  try {
+    const cwd = resolveWorkspacePath(workspace);
+    const git = spawn('git', ['branch', '-a'], { cwd });
+    let output = '';
+    git.stdout.on('data', (d) => output += d.toString());
+    git.on('close', (code) => {
+      if (code !== 0) return res.status(500).json({ error: 'Failed to list branches' });
+      const lines = output.split('\n');
+      const branchMap = new Map();
+      
+      lines.forEach(line => {
+        const isCurrent = line.startsWith('*');
+        let rawName = line.replace(/^\*\s*/, '').trim();
+        if (!rawName || rawName.includes('->')) return;
+        
+        // Strip remote prefix if present: remotes/origin/branch-name -> branch-name
+        const cleanName = rawName.replace(/^remotes\/[^/]+\//, '');
+        
+        if (!branchMap.has(cleanName) || isCurrent) {
+          branchMap.set(cleanName, { name: cleanName, isCurrent });
+        }
+      });
+      
+      const branches = Array.from(branchMap.values());
+      res.json({ branches });
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Git push to specific branch
+app.post('/api/git/push', authenticate, (req, res) => {
+  const { workspace, branch } = req.body;
+  if (!workspace) return res.status(400).json({ error: 'Missing workspace' });
+  const targetBranch = branch || 'main';
+
+  try {
+    const cwd = resolveWorkspacePath(workspace);
+    const git = spawn('git', ['push', 'origin', targetBranch], { cwd });
+    let stderr = '';
+    git.stderr.on('data', (d) => stderr += d.toString());
+    git.on('close', (code) => {
+      if (code === 0) {
+        res.json({ status: 'success', log: `Pushed successfully to branch: ${targetBranch}` });
+      } else {
+        res.status(500).json({ error: `Push failed: ${stderr}` });
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Git checkout branch
+app.post('/api/git/checkout', authenticate, (req, res) => {
+  const { workspace, branch } = req.body;
+  if (!workspace || !branch) return res.status(400).json({ error: 'Missing parameters' });
+
+  try {
+    const cwd = resolveWorkspacePath(workspace);
+    const git = spawn('git', ['checkout', branch], { cwd });
+    let stderr = '';
+    git.stderr.on('data', (d) => stderr += d.toString());
+    git.on('close', (code) => {
+      if (code === 0) {
+        res.json({ status: 'success', log: `Checked out to branch: ${branch}` });
+      } else {
+        res.status(500).json({ error: `Checkout failed: ${stderr}` });
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Duplicate /preview/:port/* route removed — primary handler above covers all cases.
+
+// --- Fallback Referer-based Proxy ---
+// Catch requests that don't match any route above but were initiated by a proxied page.
+app.all('*', (req, res, next) => {
+  const referer = req.headers.referer;
+  let port = null;
+  let workspaceName = null;
+
+  let isPreviewMode = false;
+  if (referer) {
+    const previewMatch = referer.match(/\/preview\/(\d+)/);
+    const gatewayMatch = referer.match(/\/gateway\/([^/]+)\/port\/(\d+)/);
+    if (previewMatch) {
+      port = parseInt(previewMatch[1], 10);
+      isPreviewMode = true;
+    } else if (gatewayMatch) {
+      workspaceName = decodeURIComponent(gatewayMatch[1]);
+      port = parseInt(gatewayMatch[2], 10);
+    }
+  }
+
+  // Fallback: if no port detected from Referer, check lastActiveGatewayPort
+  if (!port && lastActiveGatewayPort) {
+    port = lastActiveGatewayPort;
+  }
+
+  // Lookup workspace name if not found but port is known
+  if (!workspaceName && port) {
+    for (const [wsName, svcs] of workspaceServices.entries()) {
+      if (svcs.frontend === port || svcs.backend === port) {
+        workspaceName = wsName;
+        break;
+      }
+    }
+  }
+
+  if (port) {
+    // Verify token via cookie or referer parameter
+    let cookieToken = null;
+    if (req.headers.cookie) {
+      const cookies = req.headers.cookie.split(';').reduce((acc, c) => {
+        const [k, v] = c.trim().split('=');
+        acc[k] = v;
+        return acc;
+      }, {});
+      cookieToken = cookies['portable_token'];
+    }
+    
+    let refererToken = null;
+    try {
+      if (referer) {
+        const refUrl = new URL(referer);
+        refererToken = refUrl.searchParams.get('token');
+      }
+    } catch (e) {}
+
+    const isAuthed = (cookieToken === SECURITY_TOKEN || refererToken === SECURITY_TOKEN);
+    const isFromPreview = referer && (referer.includes('/preview/') || referer.includes('/gateway/'));
+
+    if (isAuthed || isFromPreview) {
+      // Reconstruct target path with basePath if Next.js config contains it
+      let targetPath = req.url;
+      if (workspaceName) {
+        try {
+          const wsRoot = resolveWorkspacePath(workspaceName);
+          const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+            .find(f => fs.existsSync(path.join(wsRoot, f)));
+          const hasBasePath = configFile
+            && /basePath\s*:/.test(fs.readFileSync(path.join(wsRoot, configFile), 'utf8'));
+          
+          // Redirect page navigation requests to keep them inside the gateway/preview prefix
+          const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html');
+          const isAlreadyPrefixed = req.url.startsWith('/gateway/') || req.url.startsWith('/preview/');
+          if (isHtmlRequest && !isAlreadyPrefixed) {
+            let targetUrl;
+            if (isPreviewMode) {
+              targetUrl = `/preview/${port}${req.url}`;
+            } else {
+              targetUrl = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}${req.url}`;
+            }
+            console.log(`[Gateway Redirect] Redirecting HTML navigation: ${req.url} → ${targetUrl}`);
+            return res.redirect(302, targetUrl);
+          }
+
+          if (hasBasePath) {
+            targetPath = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}${req.url}`;
+          }
+        } catch (e) {}
+      }
+
+      // Proxy request to localhost:port
+      const options = {
+        hostname: 'localhost',
+        port,
+        path: targetPath,
+        method: req.method,
+        headers: {
+          ...req.headers,
+          host: `localhost:${port}`,
+        },
+      };
+      
+      delete options.headers['authorization'];
+
+      const proxyReq = http.request(options, (proxyRes) => {
+        const outHeaders = { ...proxyRes.headers };
+        outHeaders['access-control-allow-origin'] = req.headers['origin'] || '*';
+        if (req.headers['origin']) {
+          outHeaders['access-control-allow-credentials'] = 'true';
+          outHeaders['vary'] = (outHeaders['vary'] ? outHeaders['vary'] + ', ' : '') + 'Origin';
+        }
+        res.writeHead(proxyRes.statusCode, outHeaders);
+        proxyRes.pipe(res, { end: true });
+      });
+
+      proxyReq.on('error', (err) => {
+        if (!res.headersSent) {
+          res.status(502).send(`Fallback Proxy Error: ${err.message}`);
+        }
+      });
+
+      forwardRequestBody(req, proxyReq);
+      return;
+    }
+  }
+  next();
 });
 
 // --- WebSockets for Terminals and Agents ---
@@ -1309,8 +2545,188 @@ wss.on('close', () => clearInterval(keepAliveInterval));
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const token = url.searchParams.get('token');
+  const pathname = url.pathname;
 
-  if (token !== SECURITY_TOKEN) {
+  // ── Gateway WebSocket proxy (/gateway/:workspace/__ws/:port/*) ──────────
+  // The patcher script rewrites ws://localhost:PORT to this path.
+  const gatewayWsMatch = pathname.match(/^\/gateway\/([^/]+)\/__ws\/(\d+)(\/.*)?$/);
+  if (gatewayWsMatch) {
+    const workspaceName = decodeURIComponent(gatewayWsMatch[1]);
+    const port = parseInt(gatewayWsMatch[2], 10);
+    let subPath = gatewayWsMatch[3] || '/';
+    // Strip any gateway prefix from subPath to prevent duplication
+    const gatewayPrefix = `/gateway/${workspaceName}/port/${port}`;
+    if (subPath.startsWith(gatewayPrefix)) {
+      subPath = subPath.substring(gatewayPrefix.length) || '/';
+    }
+
+    // Prepend basePath if Next.js config contains it
+    let finalPath = subPath;
+    try {
+      const wsRoot = resolveWorkspacePath(workspaceName);
+      const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+        .find(f => fs.existsSync(path.join(wsRoot, f)));
+      const hasBasePath = configFile
+        && /basePath\s*:/.test(fs.readFileSync(path.join(wsRoot, configFile), 'utf8'));
+      if (hasBasePath) {
+        finalPath = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}${subPath}`;
+      }
+    } catch (e) {
+      // fallback to original subPath
+    }
+
+    // Append original search parameters (HMR client ID, etc.)
+    finalPath += url.search || '';
+
+    console.log(`[Gateway WS] ${workspaceName} → localhost:${port}${finalPath}`);
+
+    let cookieToken = null;
+    if (req.headers.cookie) {
+      const cookies = req.headers.cookie.split(';').reduce((acc, c) => {
+        const [k, v] = c.trim().split('='); acc[k] = v; return acc;
+      }, {});
+      cookieToken = cookies['portable_token'];
+    }
+    const authorized = token === SECURITY_TOKEN || cookieToken === SECURITY_TOKEN;
+    // For __ws (HMR proxying), also allow same-origin requests with no explicit auth
+    // since the browser already authenticated when loading the page
+    const isSameOrigin = !req.headers['origin'] || req.headers['origin'].includes(req.headers['host']);
+    if (!authorized && !isSameOrigin) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+
+    // Forward the full WS handshake headers to the upstream dev server
+    const forwardHeaders = [
+      `GET ${finalPath} HTTP/1.1`,
+      `Host: localhost:${port}`,
+      `Upgrade: websocket`,
+      `Connection: Upgrade`,
+      `Sec-WebSocket-Key: ${req.headers['sec-websocket-key']}`,
+      `Sec-WebSocket-Version: ${req.headers['sec-websocket-version'] || '13'}`,
+    ];
+    if (req.headers['sec-websocket-protocol']) {
+      forwardHeaders.push(`Sec-WebSocket-Protocol: ${req.headers['sec-websocket-protocol']}`);
+    }
+    if (req.headers['sec-websocket-extensions']) {
+      forwardHeaders.push(`Sec-WebSocket-Extensions: ${req.headers['sec-websocket-extensions']}`);
+    }
+    forwardHeaders.push('', '');
+
+    const upstream = net.connect(port, 'localhost', () => {
+      upstream.write(forwardHeaders.join('\r\n'));
+      console.log(`[Gateway WS] Connected to localhost:${port}`);
+    });
+    upstream.on('error', (err) => { 
+      console.error(`[Gateway WS] Upstream error: ${err.message}`);
+      socket.destroy(); 
+    });
+    socket.on('error', (err) => { 
+      console.error(`[Gateway WS] Socket error: ${err.message}`);
+      upstream.destroy(); 
+    });
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+    return;
+  }
+
+  // ── Preview port WebSocket proxy (/preview/:port/...) ───────────────────
+  // Matches: /preview/:port/... OR any WS upgrade from a page whose cookie is set
+  const previewMatch = pathname.match(/^\/preview\/(\d+)(\/.*)?$/);
+  if (previewMatch) {
+    const port = parseInt(previewMatch[1], 10);
+    const subPath = previewMatch[2] || '/';
+    const searchString = url.search || '';
+
+    // Auth: token in query OR cookie
+    let cookieToken = null;
+    if (req.headers.cookie) {
+      const cookies = req.headers.cookie.split(';').reduce((acc, c) => {
+        const [k, v] = c.trim().split('=');
+        acc[k] = v;
+        return acc;
+      }, {});
+      cookieToken = cookies['portable_token'];
+    }
+    const authorized = token === SECURITY_TOKEN || cookieToken === SECURITY_TOKEN;
+    if (!authorized) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // Pipe the WebSocket upgrade through to the local dev server
+    const upstream = net.connect(port, 'localhost', () => {
+      upstream.write(
+        `GET ${subPath}${searchString} HTTP/1.1\r\n` +
+        `Host: localhost:${port}\r\n` +
+        `Upgrade: websocket\r\n` +
+        `Connection: Upgrade\r\n` +
+        `Sec-WebSocket-Key: ${req.headers['sec-websocket-key']}\r\n` +
+        `Sec-WebSocket-Version: ${req.headers['sec-websocket-version']}\r\n` +
+        (req.headers['sec-websocket-protocol'] ? `Sec-WebSocket-Protocol: ${req.headers['sec-websocket-protocol']}\r\n` : '') +
+        `\r\n`
+      );
+    });
+
+    upstream.on('error', () => {
+      socket.destroy();
+    });
+
+    socket.on('error', () => {
+      upstream.destroy();
+    });
+
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+    return;
+  }
+
+  // Also proxy WS upgrades that don't match /preview/:port but come from a preview page
+  // (e.g. Vite connecting to ws://tunnel.domain.com/ without /preview/ prefix)
+  let cookieToken = null;
+  if (req.headers.cookie) {
+    const cookies = req.headers.cookie.split(';').reduce((acc, c) => {
+      const [k, v] = c.trim().split('=');
+      acc[k] = v;
+      return acc;
+    }, {});
+    cookieToken = cookies['portable_token'];
+  }
+
+  // Check if this WS comes from a preview/gateway-authenticated session (for HMR root-path fallback)
+  const referer = req.headers['referer'] || req.headers['origin'] || '';
+  const refPreviewMatch = referer.match(/\/preview\/(\d+)/);
+  const refGatewayMatch = referer.match(/\/gateway\/([^/]+)\/port\/(\d+)/);
+
+  let port = null;
+  if (refPreviewMatch) {
+    port = parseInt(refPreviewMatch[1], 10);
+  } else if (refGatewayMatch) {
+    port = parseInt(refGatewayMatch[2], 10);
+  }
+
+  if (port && (cookieToken === SECURITY_TOKEN)) {
+    // Proxy this WS to the detected preview port
+    const upstream = net.connect(port, 'localhost', () => {
+      upstream.write(
+        `GET ${url.pathname}${url.search} HTTP/1.1\r\n` +
+        `Host: localhost:${port}\r\n` +
+        `Upgrade: websocket\r\n` +
+        `Connection: Upgrade\r\n` +
+        `Sec-WebSocket-Key: ${req.headers['sec-websocket-key']}\r\n` +
+        `Sec-WebSocket-Version: ${req.headers['sec-websocket-version']}\r\n` +
+        (req.headers['sec-websocket-protocol'] ? `Sec-WebSocket-Protocol: ${req.headers['sec-websocket-protocol']}\r\n` : '') +
+        `\r\n`
+      );
+    });
+
+    upstream.on('error', () => { socket.destroy(); });
+    socket.on('error', () => { upstream.destroy(); });
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+    return;
+  }
+
+  // ── Our own terminal/agent WebSockets ────────────────────────────────────
+  if (token !== SECURITY_TOKEN && cookieToken !== SECURITY_TOKEN) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;
@@ -1337,21 +2753,27 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    let proc = terminals.get(termId);
+    // Key is compound: termId + workspace so each workspace gets its own persistent shell.
+    // Switching workspaces spawns a fresh shell in the correct cwd instead of reusing
+    // the old shell from the previous workspace (which caused the green-cursor-only bug).
+    const termKey = `${termId}:${workspace}`;
 
-    // If terminal process doesn't exist, spawn it
+    let proc = terminals.get(termKey);
+
+    // If terminal process doesn't exist for this workspace, spawn it
     if (!proc) {
       let cwd;
       try {
         cwd = resolveWorkspacePath(workspace);
       } catch (err) {
         console.error(`[Host Daemon] Terminal workspace resolution failed: ${err.message}`);
-        ws.send(JSON.stringify({ type: 'error', data: err.message }));
+        ws.send(JSON.stringify({ type: 'error', data: `Workspace not found: ${workspace}\r\n${err.message}` }));
         ws.close();
         return;
       }
       const isWindows = process.platform === 'win32';
-      let shellCmd = isWindows ? 'powershell.exe' : 'sh';
+      // Prefer bash over sh on Linux for a proper interactive prompt
+      let shellCmd = isWindows ? 'powershell.exe' : (fs.existsSync('/bin/bash') ? '/bin/bash' : 'sh');
       if (isWindows) {
         const winDir = process.env.SystemRoot || 'C:\\Windows';
         const standardPs = path.join(winDir, 'System32\\WindowsPowerShell\\v1.0\\powershell.exe');
@@ -1359,36 +2781,49 @@ wss.on('connection', (ws, req) => {
           shellCmd = standardPs;
         }
       }
-      const shellArgs = isWindows ? ['-NoLogo', '-ExecutionPolicy', 'Bypass'] : [];
+      const shellArgs = isWindows ? ['-NoLogo', '-ExecutionPolicy', 'Bypass'] : ['-l'];
 
       try {
-        console.log(`[Host Daemon] Spawning PTY terminal shell: ${shellCmd}`);
+        console.log(`[Host Daemon] Spawning PTY terminal: ${shellCmd} cwd=${cwd}`);
+        const terminalEnv = { ...process.env, FORCE_COLOR: '1', TERM: 'xterm-256color' };
+        delete terminalEnv.PORT;
         proc = pty.spawn(shellCmd, shellArgs, {
-          name: 'xterm-color',
-          cols: 80,
+          name: 'xterm-256color',
+          cols: 220,
           rows: 24,
           cwd,
-          env: { ...process.env, FORCE_COLOR: '1' },
+          env: terminalEnv,
         });
 
-        terminals.set(termId, proc);
-        terminalBuffers.set(termId, []);
+        terminals.set(termKey, proc);
+        terminalBuffers.set(termKey, []);
 
         proc.onData((data) => {
-          terminalBuffers.get(termId).push(data);
-          if (terminalBuffers.get(termId).length > 200) {
-            terminalBuffers.get(termId).shift();
+          terminalBuffers.get(termKey).push(data);
+          if (terminalBuffers.get(termKey).length > 200) {
+            terminalBuffers.get(termKey).shift();
           }
-          broadcastToTerminal(termId, { type: 'data', data });
+          broadcastToTerminal(termKey, { type: 'data', data });
         });
 
         proc.onExit(({ exitCode }) => {
-          broadcastToTerminal(termId, { type: 'exit', code: exitCode });
-          terminals.delete(termId);
-          terminalBuffers.delete(termId);
+          broadcastToTerminal(termKey, { type: 'exit', code: exitCode });
+          terminals.delete(termKey);
+          terminalBuffers.delete(termKey);
         });
 
         proc.isPty = true;
+
+        // Custom prompt: dynamic current directory — updates on cd
+        // Linux: show last 2 path segments relative to workspace root (/Portfolio/subdir $)
+        // Windows: show path relative to workspace root
+        setTimeout(() => {
+          if (isWindows) {
+            proc.write(`function prompt { $rel = $PWD.Path -replace [regex]::Escape((Get-Location).Drive.Root), '/'; "PS $rel> " }; Clear-Host\r`);
+          } else {
+            proc.write(`export PS1='\\[\\033[01;32m\\]\\w \\$\\[\\033[00m\\] '; clear\r`);
+          }
+        }, 300);
       } catch (ptyError) {
         console.error('[Host Daemon] Failed to spawn PTY, falling back to child_process.spawn', ptyError);
         proc = spawn(shellCmd, shellArgs, {
@@ -1396,40 +2831,42 @@ wss.on('connection', (ws, req) => {
           env: { ...process.env, FORCE_COLOR: '1' },
         });
 
-        terminals.set(termId, proc);
-        terminalBuffers.set(termId, []);
+        terminals.set(termKey, proc);
+        terminalBuffers.set(termKey, []);
 
         proc.stdout.on('data', (data) => {
           const text = data.toString();
-          terminalBuffers.get(termId).push(text);
-          if (terminalBuffers.get(termId).length > 200) {
-            terminalBuffers.get(termId).shift();
+          terminalBuffers.get(termKey).push(text);
+          if (terminalBuffers.get(termKey).length > 200) {
+            terminalBuffers.get(termKey).shift();
           }
-          broadcastToTerminal(termId, { type: 'data', data: text });
+          broadcastToTerminal(termKey, { type: 'data', data: text });
         });
 
         proc.stderr.on('data', (data) => {
           const text = data.toString();
-          terminalBuffers.get(termId).push(text);
-          broadcastToTerminal(termId, { type: 'data', data: text });
+          terminalBuffers.get(termKey).push(text);
+          broadcastToTerminal(termKey, { type: 'data', data: text });
         });
 
         proc.on('close', () => {
-          broadcastToTerminal(termId, { type: 'exit', code: 0 });
-          terminals.delete(termId);
-          terminalBuffers.delete(termId);
+          broadcastToTerminal(termKey, { type: 'exit', code: 0 });
+          terminals.delete(termKey);
+          terminalBuffers.delete(termKey);
         });
 
         proc.isPty = false;
       }
     }
 
-    // Assign ws reference
-    ws.termId = termId;
+    // Tag this WS client with the compound key so broadcastToTerminal reaches it
+    ws.termId = termKey;
 
-    // Send buffered catch-up text
-    const buffer = terminalBuffers.get(termId) || [];
-    ws.send(JSON.stringify({ type: 'data', data: buffer.join('') }));
+    // Send buffered catch-up text so reconnecting clients see previous output immediately
+    const buffer = terminalBuffers.get(termKey) || [];
+    if (buffer.length > 0) {
+      ws.send(JSON.stringify({ type: 'data', data: buffer.join('') }));
+    }
 
     ws.on('message', (msg) => {
       try {
@@ -1444,22 +2881,25 @@ wss.on('connection', (ws, req) => {
             }
             proc.stdin.write(inputData);
           }
+        } else if (payload.type === 'resize' && proc.isPty) {
+          // Client sends actual XTerm dimensions after init so PTY wrapping matches
+          const cols = Math.max(40, Math.min(500, parseInt(payload.cols, 10) || 220));
+          const rows = Math.max(10, Math.min(100, parseInt(payload.rows, 10) || 24));
+          try { proc.resize(cols, rows); } catch (_) {}
         }
       } catch (err) {
-        let inputData = msg.toString('utf8');
+        // Raw input fallback
+        const inputData = msg.toString('utf8');
         if (proc.isPty) {
           proc.write(inputData);
         } else {
-          if (inputData === '\r') {
-            inputData = process.platform === 'win32' ? '\r\n' : '\n';
-          }
           proc.stdin.write(inputData);
         }
       }
     });
 
     ws.on('close', () => {
-      // We do NOT kill the terminal process here! That's what keeps it persistent.
+      // We do NOT kill the terminal process here — persistent across reconnects.
       // The process stays alive, buffering output in terminalBuffers, ready for reconnect.
     });
   }
@@ -1583,6 +3023,7 @@ wss.on('connection', (ws, req) => {
       console.log(`[Host Daemon] Spawning agent PTY: ${cmd} ${args.join(' ')}`);
       // Build env for the agent process
       const agentEnv = { ...process.env, FORCE_COLOR: '1' };
+      delete agentEnv.PORT;
       ptyProcess = pty.spawn(cmd, args, {
         name: 'xterm-color',
         cols: 220,

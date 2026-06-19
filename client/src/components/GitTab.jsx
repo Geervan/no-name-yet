@@ -1,6 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { GitCommit, GitPullRequest, ChevronRight, FileCode, Check, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
 
+const safeParseResponse = async (res) => {
+  const text = await res.text();
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    try {
+      return JSON.parse(text);
+    } catch (err) {
+      return { error: `Invalid JSON response: ${text.slice(0, 200) || '(empty body)'}` };
+    }
+  }
+  return { error: text || `HTTP Error ${res.status}` };
+};
+
 export default function GitTab({ apiHost, token, activeWorkspace }) {
   const [changedFiles, setChangedFiles] = useState([]);
   const [selectedFiles, setSelectedFiles] = useState({});
@@ -13,6 +26,142 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
   const [log, setLog] = useState('');
   const [modalConfig, setModalConfig] = useState(null);
 
+  const [branches, setBranches] = useState([]);
+  const [selectedBranch, setSelectedBranch] = useState('');
+  const [branchLoading, setBranchLoading] = useState(false);
+  const [isFilesCollapsed, setIsFilesCollapsed] = useState(true);
+
+  const fetchBranches = async () => {
+    if (!activeWorkspace) return;
+    setBranchLoading(true);
+    try {
+      const res = await fetch(`${apiHost}/api/git/branches?workspace=${activeWorkspace}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await safeParseResponse(res);
+      if (data.branches) {
+        setBranches(data.branches);
+        const current = data.branches.find(b => b.isCurrent);
+        if (current) {
+          setSelectedBranch(current.name);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch branches:', err);
+    } finally {
+      setBranchLoading(false);
+    }
+  };
+
+  const handleGithubAuth = async () => {
+    setGitRunning(true);
+    setError('');
+    setLog('');
+    try {
+      const res = await fetch(`${apiHost}/api/git/github-auth`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ workspace: activeWorkspace })
+      });
+      const data = await safeParseResponse(res);
+      if (res.ok) {
+        setLog(data.log || 'GitHub Credentials successfully linked.');
+      } else {
+        setError(data.error || 'Failed to authenticate.');
+      }
+    } catch (err) {
+      setError(`GitHub Auth failed: ${err.message}`);
+    } finally {
+      setGitRunning(false);
+    }
+  };
+
+  const handleGitAddAll = async () => {
+    setGitRunning(true);
+    setError('');
+    setLog('');
+    try {
+      const res = await fetch(`${apiHost}/api/git/add-all`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ workspace: activeWorkspace })
+      });
+      const data = await safeParseResponse(res);
+      if (res.ok) {
+        setLog(data.log || 'Staged all modifications.');
+        fetchGitStatus();
+      } else {
+        setError(data.error || 'Failed to stage changes.');
+      }
+    } catch (err) {
+      setError(`Add All failed: ${err.message}`);
+    } finally {
+      setGitRunning(false);
+    }
+  };
+
+  const handleCheckoutBranch = async (branchName) => {
+    if (!branchName || branchName === selectedBranch) return;
+    setGitRunning(true);
+    setError('');
+    setLog('');
+    try {
+      const res = await fetch(`${apiHost}/api/git/checkout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ workspace: activeWorkspace, branch: branchName })
+      });
+      const data = await safeParseResponse(res);
+      if (res.ok) {
+        setLog(data.log || `Checked out to ${branchName}`);
+        fetchGitStatus();
+        fetchBranches();
+      } else {
+        setError(data.error || `Checkout failed.`);
+      }
+    } catch (err) {
+      setError(`Checkout failed: ${err.message}`);
+    } finally {
+      setGitRunning(false);
+    }
+  };
+
+  const handlePushBranch = async () => {
+    setGitRunning(true);
+    setError('');
+    setLog('');
+    try {
+      const res = await fetch(`${apiHost}/api/git/push`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ workspace: activeWorkspace, branch: selectedBranch })
+      });
+      const data = await safeParseResponse(res);
+      if (res.ok) {
+        setLog(data.log || `Pushed changes to ${selectedBranch}.`);
+        fetchGitStatus();
+      } else {
+        setError(data.error || 'Push failed.');
+      }
+    } catch (err) {
+      setError(`Push failed: ${err.message}`);
+    } finally {
+      setGitRunning(false);
+    }
+  };
+
   const fetchGitStatus = async () => {
     if (!activeWorkspace) return;
     setLoading(true);
@@ -22,7 +171,7 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
       const res = await fetch(`${apiHost}/api/git/status?workspace=${activeWorkspace}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
-      const data = await res.json();
+      const data = await safeParseResponse(res);
       if (data.error) throw new Error(data.error);
       
       setChangedFiles(data.files || []);
@@ -41,10 +190,36 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
 
   useEffect(() => {
     fetchGitStatus();
+    fetchBranches();
     setActiveDiffFile(null);
     setDiffContent('');
     setCommitMessage('');
-  }, [activeWorkspace]);
+    
+    // Auto-pull from GitHub when workspace is opened to sync changes
+    if (activeWorkspace) {
+      const autoPull = async () => {
+        try {
+          const res = await fetch(`${apiHost}/api/git/pull`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({ workspace: activeWorkspace })
+          });
+          const data = await safeParseResponse(res);
+          if (!data.error) {
+            setLog(data.output || 'Auto-pulled updates successfully.');
+            fetchGitStatus();
+          }
+        } catch (err) {
+          // Silent fail on auto-pull to not annoy user
+          console.error('Auto-pull failed:', err);
+        }
+      };
+      autoPull();
+    }
+  }, [activeWorkspace, apiHost, token]);
 
   const viewDiff = async (filePath) => {
     setError('');
@@ -53,7 +228,7 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
       const res = await fetch(`${apiHost}/api/git/diff?workspace=${activeWorkspace}&filePath=${filePath}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
-      const data = await res.json();
+      const data = await safeParseResponse(res);
       if (data.error) throw new Error(data.error);
       setActiveDiffFile(filePath);
       setDiffContent(data.diff || 'No changes detected.');
@@ -93,7 +268,7 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
           files: filesToCommit
         })
       });
-      const data = await res.json();
+      const data = await safeParseResponse(res);
       if (data.error) throw new Error(data.error);
       
       setLog(data.log || 'Push completed successfully.');
@@ -120,7 +295,7 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
         },
         body: JSON.stringify({ workspace: activeWorkspace })
       });
-      const data = await res.json();
+      const data = await safeParseResponse(res);
       if (data.error) throw new Error(data.error);
       
       setLog(data.output || 'Pulled updates successfully.');
@@ -155,7 +330,7 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
               filePath
             })
           });
-          const data = await res.json();
+          const data = await safeParseResponse(res);
           if (data.error) throw new Error(data.error);
 
           setLog(`Discarded changes in: ${filePath}`);
@@ -190,7 +365,7 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
               workspace: activeWorkspace
             })
           });
-          const data = await res.json();
+          const data = await safeParseResponse(res);
           if (data.error) throw new Error(data.error);
 
           setLog('Discarded all changes and cleaned directory.');
@@ -215,7 +390,7 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
   return (
     <div className="tab-panel" style={{ marginBottom: '100px' }}>
       <div className="eyebrow-badge">Repository Versioning</div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
         <h2 className="section-title" style={{ margin: '0' }}>Git Control</h2>
         <button
           onClick={fetchGitStatus}
@@ -237,6 +412,11 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
         </button>
       </div>
 
+      <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginBottom: '16px', display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span>Directory:</span>
+        <span style={{ color: 'var(--accent-color)' }}>/{activeWorkspace}</span>
+      </div>
+
       {error && (
         <div className="double-bezel-card" style={{ borderColor: 'rgba(239, 68, 68, 0.2)' }}>
           <div className="double-bezel-card-inner" style={{ color: '#f87171', fontSize: '13px' }}>
@@ -253,10 +433,126 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
         </div>
       )}
 
+      {/* Git Actions & Branch Selector */}
+      <div className="double-bezel-card" style={{ marginBottom: '12px' }}>
+        <div className="double-bezel-card-inner" style={{ padding: '12px', display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center' }}>
+          
+          {/* Branch Dropdown */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '10px', fontWeight: '700', color: 'var(--text-secondary)' }}>BRANCH:</span>
+            {branchLoading ? (
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>loading branches...</span>
+            ) : (
+              <select
+                value={selectedBranch}
+                onChange={(e) => handleCheckoutBranch(e.target.value)}
+                disabled={gitRunning}
+                style={{
+                  background: '#0a0a0a',
+                  border: '1px solid var(--border-glow)',
+                  borderRadius: '8px',
+                  color: '#10b981',
+                  padding: '6px 32px 6px 12px',
+                  fontSize: '11px',
+                  fontWeight: '700',
+                  outline: 'none',
+                  cursor: 'pointer',
+                  fontFamily: 'var(--font-mono)',
+                  appearance: 'none',
+                  backgroundImage: `url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2310b981' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E")`,
+                  backgroundRepeat: 'no-repeat',
+                  backgroundPosition: 'right 10px center',
+                  backgroundSize: '12px',
+                  minWidth: '120px',
+                  textAlign: 'left',
+                }}
+              >
+                {branches.map(b => (
+                  <option 
+                    key={b.name} 
+                    value={b.name}
+                    style={{ background: '#0a0a0a', color: '#10b981' }}
+                  >
+                    {b.isCurrent ? `* ${b.name}` : b.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+
+          {/* Action Buttons */}
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginLeft: 'auto' }}>
+            <button
+              onClick={handleGitAddAll}
+              disabled={gitRunning}
+              style={{
+                background: 'rgba(52, 211, 153, 0.1)',
+                border: '1px solid rgba(52, 211, 153, 0.3)',
+                borderRadius: '8px',
+                padding: '6px 12px',
+                fontSize: '11px',
+                fontWeight: '600',
+                color: '#34d399',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px'
+              }}
+              title="Stage all changes in workspace"
+            >
+              <span>git add .</span>
+            </button>
+
+            <button
+              onClick={handlePushBranch}
+              disabled={gitRunning || !selectedBranch}
+              style={{
+                background: 'rgba(16, 185, 129, 0.15)',
+                border: '1px solid var(--border-accent)',
+                borderRadius: '8px',
+                padding: '6px 12px',
+                fontSize: '11px',
+                fontWeight: '600',
+                color: 'var(--accent-color)',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px'
+              }}
+              title="Push changes to remote repository"
+            >
+              <span>Push</span>
+            </button>
+
+            <button
+              onClick={handleGithubAuth}
+              disabled={gitRunning}
+              style={{
+                background: 'rgba(167, 139, 250, 0.12)',
+                border: '1px solid rgba(167, 139, 250, 0.35)',
+                borderRadius: '8px',
+                padding: '6px 12px',
+                fontSize: '11px',
+                fontWeight: '600',
+                color: '#c084fc',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px'
+              }}
+              title="Link GitHub Credentials to Remote URL"
+            >
+              <span>🔑 GitHub Auth</span>
+            </button>
+          </div>
+
+        </div>
+      </div>
+
       {/* Changed Files List */}
       <div className="double-bezel-card">
         <div className="double-bezel-card-inner">
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: isFilesCollapsed ? '0' : '12px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               {changedFiles.length > 0 && (
                 <input
@@ -274,7 +570,20 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
                   title="Select / Deselect All"
                 />
               )}
-              <h3 style={{ fontSize: '14px', fontWeight: '600' }}>Changed Files</h3>
+              <div 
+                onClick={() => setIsFilesCollapsed(c => !c)}
+                style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', userSelect: 'none' }}
+              >
+                <ChevronRight 
+                  size={14} 
+                  style={{ 
+                    color: 'var(--text-secondary)',
+                    transform: isFilesCollapsed ? 'none' : 'rotate(90deg)', 
+                    transition: 'transform 0.15s' 
+                  }} 
+                />
+                <h3 style={{ fontSize: '14px', fontWeight: '600', margin: 0 }}>Changed Files ({changedFiles.length})</h3>
+              </div>
             </div>
             <div style={{ display: 'flex', gap: '8px' }}>
               {changedFiles.length > 0 && (
@@ -323,84 +632,88 @@ export default function GitTab({ apiHost, token, activeWorkspace }) {
             </div>
           </div>
 
-          {loading ? (
-            <p className="text-sub">Checking workspace git diff status...</p>
-          ) : changedFiles.length === 0 ? (
-            <p className="text-sub">No modifications detected. Clean working tree.</p>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '200px', overflowY: 'auto', paddingRight: '4px' }}>
-              {changedFiles.map((file) => (
-                <div
-                  key={file.path}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    padding: '8px 10px',
-                    background: 'rgba(255, 255, 255, 0.01)',
-                    border: '1px solid var(--border-glow)',
-                    borderRadius: '8px'
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', maxWidth: '70%' }}>
-                    <input
-                      type="checkbox"
-                      checked={!!selectedFiles[file.path]}
-                      onChange={() => handleToggleFile(file.path)}
-                      style={{ cursor: 'pointer', accentColor: 'var(--accent-color)' }}
-                    />
-                    <FileCode size={14} style={{ color: 'var(--text-secondary)' }} />
-                    <span style={{ fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--text-primary)' }}>
-                      {file.path}
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <span style={{
-                      fontSize: '9px',
-                      fontWeight: '700',
-                      padding: '2px 6px',
-                      borderRadius: '4px',
-                      background: file.code === '??' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(16, 185, 129, 0.1)',
-                      color: file.code === '??' ? '#ef4444' : 'var(--accent-color)'
-                    }}>
-                      {file.code === '??' ? 'Untracked' : 'Modified'}
-                    </span>
-                    <button
-                      onClick={(e) => handleDiscardFile(file.path, e)}
-                      disabled={gitRunning}
+          {!isFilesCollapsed && (
+            <>
+              {loading ? (
+                <p className="text-sub">Checking workspace git diff status...</p>
+              ) : changedFiles.length === 0 ? (
+                <p className="text-sub">No modifications detected. Clean working tree.</p>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '200px', overflowY: 'auto', paddingRight: '4px' }}>
+                  {changedFiles.map((file) => (
+                    <div
+                      key={file.path}
                       style={{
-                        background: 'transparent',
-                        border: 'none',
-                        color: 'var(--text-muted)',
-                        cursor: 'pointer',
                         display: 'flex',
                         alignItems: 'center',
-                        padding: '4px',
-                        transition: 'color 0.2s'
-                      }}
-                      onMouseEnter={(e) => e.currentTarget.style.color = '#ef4444'}
-                      onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-muted)'}
-                      title="Discard Changes"
-                    >
-                      <RotateCcw size={12} />
-                    </button>
-                    <button
-                      onClick={() => viewDiff(file.path)}
-                      style={{
-                        background: 'transparent',
-                        border: 'none',
-                        color: 'var(--accent-color)',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'center'
+                        justifyContent: 'space-between',
+                        padding: '8px 10px',
+                        background: 'rgba(255, 255, 255, 0.01)',
+                        border: '1px solid var(--border-glow)',
+                        borderRadius: '8px'
                       }}
                     >
-                      <ChevronRight size={14} />
-                    </button>
-                  </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', maxWidth: '70%' }}>
+                        <input
+                          type="checkbox"
+                          checked={!!selectedFiles[file.path]}
+                          onChange={() => handleToggleFile(file.path)}
+                          style={{ cursor: 'pointer', accentColor: 'var(--accent-color)' }}
+                        />
+                        <FileCode size={14} style={{ color: 'var(--text-secondary)' }} />
+                        <span style={{ fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--text-primary)' }}>
+                          {file.path}
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{
+                          fontSize: '9px',
+                          fontWeight: '700',
+                          padding: '2px 6px',
+                          borderRadius: '4px',
+                          background: file.code === '??' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(16, 185, 129, 0.1)',
+                          color: file.code === '??' ? '#ef4444' : 'var(--accent-color)'
+                        }}>
+                          {file.code === '??' ? 'Untracked' : 'Modified'}
+                        </span>
+                        <button
+                          onClick={(e) => handleDiscardFile(file.path, e)}
+                          disabled={gitRunning}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: 'var(--text-muted)',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            padding: '4px',
+                            transition: 'color 0.2s'
+                          }}
+                          onMouseEnter={(e) => e.currentTarget.style.color = '#ef4444'}
+                          onMouseLeave={(e) => e.currentTarget.style.color = 'var(--text-muted)'}
+                          title="Discard Changes"
+                        >
+                          <RotateCcw size={12} />
+                        </button>
+                        <button
+                          onClick={() => viewDiff(file.path)}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: 'var(--accent-color)',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center'
+                          }}
+                        >
+                          <ChevronRight size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              )}
+            </>
           )}
         </div>
       </div>

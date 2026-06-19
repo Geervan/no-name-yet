@@ -133,15 +133,24 @@ export default function App() {
       const res = await fetch(`${normalizedHost}/api/auth/check`, {
         headers: { 'Authorization': `Bearer ${tokenToCheck.trim()}` }
       });
-      if (res.status === 200) {
-        setIsAuthenticated(true);
-        localStorage.setItem('portable_api_host', normalizedHost);
-        localStorage.setItem('portable_token', tokenToCheck.trim());
-        setApiHost(normalizedHost);
-        setToken(tokenToCheck.trim());
+      const contentType = res.headers.get('content-type') || '';
+      if (res.status === 200 && contentType.includes('application/json')) {
+        const data = await res.json().catch(() => ({}));
+        if (data.status === 'ok') {
+          setIsAuthenticated(true);
+          localStorage.setItem('portable_api_host', normalizedHost);
+          localStorage.setItem('portable_token', tokenToCheck.trim());
+          setApiHost(normalizedHost);
+          setToken(tokenToCheck.trim());
+          return;
+        }
+      }
+
+      setIsAuthenticated(false);
+      if (!contentType.includes('application/json')) {
+        setAuthError(`Auth failed: Target port is a web/SPA server, not the Host Daemon. Please check the port (defaults to 5000).`);
       } else {
         const body = await res.text().catch(() => '');
-        setIsAuthenticated(false);
         setAuthError(`Auth failed (${res.status}): ${body || 'Invalid token'}`);
       }
     } catch (err) {
@@ -437,6 +446,7 @@ export default function App() {
         </div>
         <div style={{ display: activeTab === 'terminal' ? 'block' : 'none', height: '100%' }}>
           <TerminalTab
+            apiHost={apiHost}
             wsHost={wsHost}
             token={token}
             activeWorkspace={activeWorkspace}

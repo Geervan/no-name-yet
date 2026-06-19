@@ -4,7 +4,7 @@ import { WebLinksAddon } from 'xterm-addon-web-links';
 import { Play, Clipboard, RotateCcw, Plus, Trash2, ChevronRight, FileCode } from 'lucide-react';
 import 'xterm/css/xterm.css';
 
-export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminalData, problems = [], onSelectFile }) {
+export default function TerminalTab({ apiHost, wsHost, token, activeWorkspace, onTerminalData, problems = [], onSelectFile }) {
   const [sessions, setSessions] = useState(['shell-1']);
   const [activeSession, setActiveSession] = useState('shell-1');
   const [expandedFiles, setExpandedFiles] = useState({});
@@ -80,23 +80,54 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
     term.loadAddon(new WebLinksAddon());
     term.open(container);
 
+    // Ensure cursor is visible when user interacts with terminal
+    const ensureCursorVisible = () => {
+      term.focus();
+      // Force cursor to be visible by resetting cursor blink
+      term.cursorBlink = true;
+    };
+
+    container.addEventListener('touchstart', ensureCursorVisible, { passive: true });
+    container.addEventListener('focus', ensureCursorVisible);
+    container.addEventListener('click', ensureCursorVisible);
+
     // iOS touch scrollback: translate swipe gestures into XTerm scroll
+    let touchStartX = 0;
     let touchStartY = 0;
-    const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
-    const onTouchMove = (e) => {
-      const dy = touchStartY - e.touches[0].clientY;
+    const onTouchStart = (e) => {
+      touchStartX = e.touches[0].clientX;
       touchStartY = e.touches[0].clientY;
-      // Each ~20px of swipe = 1 line scroll
-      const lines = Math.round(dy / 20);
-      if (lines !== 0) {
-        term.scrollLines(lines);
+    };
+    const onTouchMove = (e) => {
+      const dx = touchStartX - e.touches[0].clientX;
+      const dy = touchStartY - e.touches[0].clientY;
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+      
+      // Determine dominant direction of swipe
+      const isHorizontal = Math.abs(dx) > Math.abs(dy);
+      
+      if (isHorizontal) {
+        // Horizontal scroll - each ~20px of swipe = scroll viewport
+        const scrollAmount = dx * 2; // Multiplier for smoother horizontal scroll
+        term.element.scrollLeft += scrollAmount;
         e.preventDefault();
+      } else {
+        // Vertical scroll - each ~20px of swipe = 1 line scroll
+        const lines = Math.round(dy / 20);
+        if (lines !== 0) {
+          term.scrollLines(lines);
+          e.preventDefault();
+        }
       }
     };
     container.addEventListener('touchstart', onTouchStart, { passive: true });
     container.addEventListener('touchmove', onTouchMove, { passive: false });
     // Store cleanup refs on the term object
     term._touchCleanup = () => {
+      container.removeEventListener('touchstart', ensureCursorVisible);
+      container.removeEventListener('focus', ensureCursorVisible);
+      container.removeEventListener('click', ensureCursorVisible);
       container.removeEventListener('touchstart', onTouchStart);
       container.removeEventListener('touchmove', onTouchMove);
     };
@@ -115,6 +146,13 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
     ws.onopen = () => {
       // Reset retry delay on successful connection
       sockets.current[sessionId]._retryDelay = 1000;
+
+      // Send actual XTerm dimensions to the server so the PTY cols/rows match
+      // what the user sees. This prevents garbled line-wrapping on wide terminals.
+      const term = termInstances.current[sessionId];
+      if (term) {
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      }
     };
 
     ws.onmessage = (event) => {
@@ -126,7 +164,11 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
             onTerminalData(sessionId, payload.data);
           }
         } else if (payload.type === 'exit') {
-          term.write('\r\n[Process terminated]');
+          term.write('\r\n\x1b[33m[Process exited]\x1b[0m\r\n');
+        } else if (payload.type === 'error') {
+          // Server rejected this session (e.g. workspace path not found).
+          // Show it clearly so the user knows what's wrong instead of a blank green cursor.
+          term.write(`\r\n\x1b[31m[Server error]\x1b[0m ${payload.data || ''}\r\n`);
         }
       } catch (err) {
         term.write(event.data);
@@ -235,6 +277,37 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
     }
   };
 
+  const handleGithubAuth = async () => {
+    const term = termInstances.current[activeSession];
+    if (term) {
+      term.write(`\r\n\x1b[35m[GitHub Auth] Connecting credentials...\x1b[0m\r\n`);
+    }
+    try {
+      const res = await fetch(`${apiHost}/api/git/github-auth`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ workspace: activeWorkspace })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (term) {
+          term.write(`\x1b[32m[GitHub Auth] ✓ ${data.log || 'Success'}\x1b[0m\r\n`);
+        }
+      } else {
+        if (term) {
+          term.write(`\x1b[31m[GitHub Auth Error] ✗ ${data.error || 'Failed'}\x1b[0m\r\n`);
+        }
+      }
+    } catch (err) {
+      if (term) {
+        term.write(`\x1b[31m[GitHub Auth Error] ✗ Connection failed: ${err.message}\x1b[0m\r\n`);
+      }
+    }
+  };
+
   if (!activeWorkspace) {
     return (
       <div className="tab-panel" style={{ textAlign: 'center', marginTop: '40px' }}>
@@ -246,7 +319,11 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
   return (
     <div className="tab-panel" style={{ display: 'flex', flexDirection: 'column', minHeight: '100%', paddingBottom: '120px' }}>
       <div className="eyebrow-badge">Virtual Shells</div>
-      <h2 className="section-title">Persistent Terminals</h2>
+      <h2 className="section-title" style={{ marginBottom: 4 }}>Persistent Terminals</h2>
+      <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginBottom: '16px', display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span>Directory:</span>
+        <span style={{ color: 'var(--accent-color)' }}>/{activeWorkspace}</span>
+      </div>
 
       {/* Terminal tabs selectors */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', overflowX: 'auto', overflowY: 'hidden', padding: '8px 4px', minHeight: '48px', width: '100%' }}>
@@ -404,6 +481,38 @@ export default function TerminalTab({ wsHost, token, activeWorkspace, onTerminal
               }}
             >
               npm i
+            </button>
+            <button
+              onClick={handleGithubAuth}
+              style={{
+                background: 'rgba(167, 139, 250, 0.12)',
+                border: '1px solid rgba(167, 139, 250, 0.35)',
+                color: '#c084fc',
+                fontSize: '11px',
+                fontWeight: '600',
+                padding: '6px 12px',
+                borderRadius: '8px',
+                cursor: 'pointer',
+                fontFamily: 'var(--font-mono)'
+              }}
+            >
+              🔑 GitHub Auth
+            </button>
+            <button
+              onClick={() => runQuickCommand('\x03')}
+              style={{
+                background: 'rgba(239, 68, 68, 0.1)',
+                border: '1px solid rgba(239, 68, 68, 0.3)',
+                color: '#f87171',
+                fontSize: '11px',
+                fontWeight: '600',
+                padding: '6px 12px',
+                borderRadius: '8px',
+                cursor: 'pointer',
+                fontFamily: 'var(--font-mono)'
+              }}
+            >
+              Ctrl+C
             </button>
           </div>
         </div>
