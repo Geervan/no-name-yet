@@ -5,7 +5,7 @@ for %%I in ("%cd%") do set PROJECT_NAME=%%~nxI
 
 set VPS=root@168.144.83.115
 set REMOTE_PATH=/root/workspaces/%PROJECT_NAME%
-set ARCHIVE=%TEMP%%PROJECT_NAME%.tar.gz
+set ARCHIVE=%TEMP%\push_tmp_%PROJECT_NAME%.tar.gz
 
 echo.
 echo =========================================
@@ -16,18 +16,31 @@ echo.
 echo [1/4] Creating archive...
 
 tar ^
---exclude=node_modules ^
---exclude=.next ^
---exclude=dist ^
---exclude=build ^
---exclude=coverage ^
---exclude=**pycache** ^
+--exclude="node_modules" ^
+--exclude="*/node_modules" ^
+--exclude="*/node_modules/*" ^
+--exclude=".next" ^
+--exclude="*/.next" ^
+--exclude="*/.next/*" ^
+--exclude="dist" ^
+--exclude="*/dist" ^
+--exclude="*/dist/*" ^
+--exclude="build" ^
+--exclude="*/build" ^
+--exclude="*/build/*" ^
+--exclude="coverage" ^
+--exclude="*/coverage" ^
+--exclude="*/coverage/*" ^
+--exclude="*.tar.gz" ^
+--exclude="*.zip" ^
+--exclude="*__pycache__*" ^
+--exclude="*.pyc" ^
 -czf "%ARCHIVE%" .
 
 if errorlevel 1 (
-echo Failed to create archive.
-pause
-exit /b 1
+  echo Failed to create archive.
+  pause
+  exit /b 1
 )
 
 echo.
@@ -36,10 +49,10 @@ echo [2/4] Uploading archive...
 scp "%ARCHIVE%" %VPS%:/tmp/%PROJECT_NAME%.tar.gz
 
 if errorlevel 1 (
-echo Upload failed.
-del "%ARCHIVE%" >nul 2>&1
-pause
-exit /b 1
+  echo Upload failed.
+  del "%ARCHIVE%" >nul 2>&1
+  pause
+  exit /b 1
 )
 
 echo.
@@ -48,10 +61,10 @@ echo [3/4] Extracting on VPS...
 ssh %VPS% "mkdir -p %REMOTE_PATH% && tar -xzf /tmp/%PROJECT_NAME%.tar.gz -C %REMOTE_PATH% && rm -f /tmp/%PROJECT_NAME%.tar.gz"
 
 if errorlevel 1 (
-echo Remote extraction failed.
-del "%ARCHIVE%" >nul 2>&1
-pause
-exit /b 1
+  echo Remote extraction failed.
+  del "%ARCHIVE%" >nul 2>&1
+  pause
+  exit /b 1
 )
 
 echo.
