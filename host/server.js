@@ -101,6 +101,35 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
   var _trailingSlash = ${trailingSlash};
   var _gwBase        = '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + _currentPort;
 
+  // Patch Location.prototype.pathname to transparently hide gateway/preview prefixes from routers
+  try {
+    var descPathname = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname');
+    if (descPathname && descPathname.get) {
+      var origGetPathname = descPathname.get;
+      Object.defineProperty(Location.prototype, 'pathname', {
+        get: function() {
+          var path = origGetPathname.call(this);
+          if (path.indexOf('/gateway/') === 0) {
+            var parts = path.split('/');
+            if (parts.length >= 5 && parts[3] === 'port') {
+              return '/' + parts.slice(5).join('/');
+            }
+          } else if (path.indexOf('/preview/') === 0) {
+            var parts = path.split('/');
+            if (parts.length >= 3) {
+              return '/' + parts.slice(3).join('/');
+            }
+          }
+          return path;
+        },
+        configurable: true,
+        enumerable: true
+      });
+    }
+  } catch (e) {
+    console.error('[GW] Failed to patch Location.pathname:', e);
+  }
+
   function rewriteUrl(urlStr, baseHref) {
     try {
       var u = new URL(urlStr, baseHref || location.href);
@@ -233,8 +262,41 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
     return _origOpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments, 2)));
   };
 
-  // 4. Clean token from URL bar
-  if (window.history && window.history.replaceState) {
+  function rewriteHistoryUrl(urlStr) {
+    if (!urlStr) return urlStr;
+    try {
+      var u = new URL(urlStr, location.href);
+      if (u.hostname === location.hostname) {
+        var rest = u.pathname + u.search + u.hash;
+        if (!rest.startsWith('/gateway/') && !rest.startsWith('/preview/') && !rest.startsWith('/ws-static/')) {
+          var newPath = _gwBase + (rest.startsWith('/') ? rest : '/' + rest);
+          return location.origin + newPath;
+        }
+      }
+      return urlStr;
+    } catch(e) { return urlStr; }
+  }
+
+  // 4. Clean token from URL bar and patch History API
+  if (window.history) {
+    var _origPush = window.history.pushState;
+    window.history.pushState = function(state, title, url) {
+      var target = url;
+      if (target !== undefined && target !== null) {
+        target = rewriteHistoryUrl(String(target));
+      }
+      return _origPush.call(this, state, title, target);
+    };
+
+    var _origReplace = window.history.replaceState;
+    window.history.replaceState = function(state, title, url) {
+      var target = url;
+      if (target !== undefined && target !== null) {
+        target = rewriteHistoryUrl(String(target));
+      }
+      return _origReplace.call(this, state, title, target);
+    };
+
     var _u = new URL(window.location.href);
     if (_u.searchParams.has('token') || _u.searchParams.has('t')) {
       _u.searchParams.delete('token'); _u.searchParams.delete('t');
@@ -708,6 +770,21 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
     delete outHeaders['content-security-policy'];
     delete outHeaders['content-security-policy-report-only'];
 
+    // Rewrite Set-Cookie paths to prevent cookie collision between workspaces
+    if (outHeaders['set-cookie']) {
+      const cookies = Array.isArray(outHeaders['set-cookie'])
+        ? outHeaders['set-cookie']
+        : [outHeaders['set-cookie']];
+      outHeaders['set-cookie'] = cookies.map(cookieStr => {
+        if (/path=\/[^;]*/i.test(cookieStr)) {
+          return cookieStr.replace(/path=\/[^;]*/i, `Path=${gwBase}`);
+        } else if (!/path=/i.test(cookieStr)) {
+          return cookieStr + `; Path=${gwBase}`;
+        }
+        return cookieStr;
+      });
+    }
+
     // Rewrite redirect locations to stay within this port's gateway
     if (outHeaders.location) {
       const loc = outHeaders.location;
@@ -913,6 +990,22 @@ app.all('/preview/:port*', (req, res) => {
     delete outHeaders['content-security-policy'];
     delete outHeaders['content-security-policy-report-only'];
 
+    // Rewrite Set-Cookie paths to prevent cookie collision between workspaces
+    if (outHeaders['set-cookie']) {
+      const cookies = Array.isArray(outHeaders['set-cookie'])
+        ? outHeaders['set-cookie']
+        : [outHeaders['set-cookie']];
+      outHeaders['set-cookie'] = cookies.map(cookieStr => {
+        const pathPrefix = `/preview/${port}`;
+        if (/path=\/[^;]*/i.test(cookieStr)) {
+          return cookieStr.replace(/path=\/[^;]*/i, `Path=${pathPrefix}`);
+        } else if (!/path=/i.test(cookieStr)) {
+          return cookieStr + `; Path=${pathPrefix}`;
+        }
+        return cookieStr;
+      });
+    }
+
     // Rewrite redirect locations to stay within the proxy
     if (outHeaders.location) {
       const loc = outHeaders.location;
@@ -961,6 +1054,35 @@ app.all('/preview/:port*', (req, res) => {
         const scriptToInject = `<script>
 (function() {
   var _proxyPort = ${port};
+
+  // Patch Location.prototype.pathname to transparently hide gateway/preview prefixes from routers
+  try {
+    var descPathname = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname');
+    if (descPathname && descPathname.get) {
+      var origGetPathname = descPathname.get;
+      Object.defineProperty(Location.prototype, 'pathname', {
+        get: function() {
+          var path = origGetPathname.call(this);
+          if (path.indexOf('/gateway/') === 0) {
+            var parts = path.split('/');
+            if (parts.length >= 5 && parts[3] === 'port') {
+              return '/' + parts.slice(5).join('/');
+            }
+          } else if (path.indexOf('/preview/') === 0) {
+            var parts = path.split('/');
+            if (parts.length >= 3) {
+              return '/' + parts.slice(3).join('/');
+            }
+          }
+          return path;
+        },
+        configurable: true,
+        enumerable: true
+      });
+    }
+  } catch (e) {
+    console.error('[GW] Failed to patch Location.pathname:', e);
+  }
 
   // 1. Patch WebSocket — redirect HMR and dev-server sockets through proxy
   var _OrigWS = window.WebSocket;
@@ -1014,8 +1136,41 @@ app.all('/preview/:port*', (req, res) => {
     return _origOpen.apply(this, arguments);
   };
 
-  // 4. Clean token/timestamp from URL bar
-  if (window.history && window.history.replaceState) {
+  function rewriteHistoryUrl(urlStr) {
+    if (!urlStr) return urlStr;
+    try {
+      var u = new URL(urlStr, location.href);
+      if (u.hostname === location.hostname) {
+        var rest = u.pathname + u.search + u.hash;
+        if (!rest.startsWith('/gateway/') && !rest.startsWith('/preview/') && !rest.startsWith('/ws-static/')) {
+          var newPath = '/preview/' + _proxyPort + (rest.startsWith('/') ? rest : '/' + rest);
+          return location.origin + newPath;
+        }
+      }
+      return urlStr;
+    } catch(e) { return urlStr; }
+  }
+
+  // 4. Clean token/timestamp from URL bar and patch History API
+  if (window.history) {
+    var _origPush = window.history.pushState;
+    window.history.pushState = function(state, title, url) {
+      var target = url;
+      if (target !== undefined && target !== null) {
+        target = rewriteHistoryUrl(String(target));
+      }
+      return _origPush.call(this, state, title, target);
+    };
+
+    var _origReplace = window.history.replaceState;
+    window.history.replaceState = function(state, title, url) {
+      var target = url;
+      if (target !== undefined && target !== null) {
+        target = rewriteHistoryUrl(String(target));
+      }
+      return _origReplace.call(this, state, title, target);
+    };
+
     var url = new URL(window.location.href);
     if (url.searchParams.has('token') || url.searchParams.has('t')) {
       url.searchParams.delete('token');

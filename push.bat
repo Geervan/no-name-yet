@@ -31,6 +31,15 @@ tar ^
 --exclude="coverage" ^
 --exclude="*/coverage" ^
 --exclude="*/coverage/*" ^
+--exclude=".vscode" ^
+--exclude="*/.vscode" ^
+--exclude="*/.vscode/*" ^
+--exclude=".agents" ^
+--exclude="*/.agents" ^
+--exclude="*/.agents/*" ^
+--exclude=".gemini" ^
+--exclude="*/.gemini" ^
+--exclude="*/.gemini/*" ^
 --exclude="*.tar.gz" ^
 --exclude="*.zip" ^
 --exclude="*__pycache__*" ^

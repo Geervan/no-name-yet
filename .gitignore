@@ -22,3 +22,7 @@ Thumbs.db
 push.sh
 pull.sh
 
+# IDE configuration and agents
+.vscode/
+.agents/
+.gemini/
