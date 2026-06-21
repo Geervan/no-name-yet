@@ -771,15 +771,17 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
     delete outHeaders['content-security-policy-report-only'];
 
     // Rewrite Set-Cookie paths to prevent cookie collision between workspaces
+    // Isolate by workspace folder prefix rather than port to allow sharing cookies between frontend and backend of the same workspace
     if (outHeaders['set-cookie']) {
       const cookies = Array.isArray(outHeaders['set-cookie'])
         ? outHeaders['set-cookie']
         : [outHeaders['set-cookie']];
+      const wsBase = `/gateway/${encodeURIComponent(workspaceName)}`;
       outHeaders['set-cookie'] = cookies.map(cookieStr => {
         if (/path=\/[^;]*/i.test(cookieStr)) {
-          return cookieStr.replace(/path=\/[^;]*/i, `Path=${gwBase}`);
+          return cookieStr.replace(/path=\/[^;]*/i, `Path=${wsBase}`);
         } else if (!/path=/i.test(cookieStr)) {
-          return cookieStr + `; Path=${gwBase}`;
+          return cookieStr + `; Path=${wsBase}`;
         }
         return cookieStr;
       });
@@ -991,12 +993,13 @@ app.all('/preview/:port*', (req, res) => {
     delete outHeaders['content-security-policy-report-only'];
 
     // Rewrite Set-Cookie paths to prevent cookie collision between workspaces
+    // Allow sharing cookies between all preview ports since they reside under /preview
     if (outHeaders['set-cookie']) {
       const cookies = Array.isArray(outHeaders['set-cookie'])
         ? outHeaders['set-cookie']
         : [outHeaders['set-cookie']];
       outHeaders['set-cookie'] = cookies.map(cookieStr => {
-        const pathPrefix = `/preview/${port}`;
+        const pathPrefix = `/preview`;
         if (/path=\/[^;]*/i.test(cookieStr)) {
           return cookieStr.replace(/path=\/[^;]*/i, `Path=${pathPrefix}`);
         } else if (!/path=/i.test(cookieStr)) {
