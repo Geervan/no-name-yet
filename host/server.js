@@ -20,6 +20,8 @@ const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 5000;
 const SECURITY_TOKEN = process.env.SECURITY_TOKEN || 'dev-secret-token-123456';
+// Use 127.0.0.1 for upstream proxies — avoids Windows localhost → ::1 resolution failures.
+const PROXY_HOST = '127.0.0.1';
 const WORKSPACES_ROOTS = (process.env.WORKSPACES_ROOT || '')
   .split(',')
   .map(r => r.trim())
@@ -43,6 +45,13 @@ const workspaceServices = new Map();
 // chains (App.tsx → Login.tsx → Button.tsx → ...) without needing the
 // Referer header to chain back to a gateway URL.
 let lastActiveGatewayPort = null;
+
+// True when a proxied path should hit the workspace backend (not the frontend dev server).
+const isBackendApiPath = (path, backendPrefix = '/api') =>
+  path.startsWith(backendPrefix) ||
+  (backendPrefix.endsWith('/') && path === backendPrefix.slice(0, -1)) ||
+  path.startsWith('/auth/') ||
+  path === '/auth';
 
 // Detect stack type from workspace directory
 const detectWorkspaceStack = async (wsPath) => {
@@ -90,49 +99,278 @@ const detectWorkspaceStack = async (wsPath) => {
   return topology;
 };
 
-// Build the gateway patcher script injected into HTML responses.
-// Transparently rewrites fetch/XHR/WebSocket calls so the browser
-// routes everything through the single gateway URL.
-const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = false) =>
-`<script>
-(function() {
-  var _workspaceName = ${JSON.stringify(workspaceName)};
-  var _currentPort   = ${currentPort};
-  var _trailingSlash = ${trailingSlash};
-  var _gwBase        = '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + _currentPort;
+// Shared client-side location proxy injected into gateway + preview HTML.
+// Keeps window.location.href / assign / replace inside the proxy prefix.
+const buildLocationProxySnippet = (basePathExpr, skipPathnameStrip = false) => `
+  var _origLocationHrefGet = Object.getOwnPropertyDescriptor(Location.prototype, 'href')?.get;
+  var _origLocationPathnameGet = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname')?.get;
+  var _origLocationToString = Location.prototype.toString;
+  var _origDocumentURLGet = Object.getOwnPropertyDescriptor(Document.prototype, 'URL')?.get || 
+                            Object.getOwnPropertyDescriptor(document, 'URL')?.get;
+  var _origDocumentURIGet = Object.getOwnPropertyDescriptor(Document.prototype, 'documentURI')?.get || 
+                            Object.getOwnPropertyDescriptor(document, 'documentURI')?.get;
 
-  // Patch Location.prototype.pathname to transparently hide gateway/preview prefixes from routers
+  function _getRawLocationHref() {
+    try {
+      if (_origLocationHrefGet) return _origLocationHrefGet.call(window.location);
+    } catch(e) {}
+    try {
+      return _origLocationToString.call(window.location);
+    } catch(e) {}
+    return window.location.href;
+  }
+
+  function _getPathPrefix() {
+    var path = _origLocationPathnameGet ? _origLocationPathnameGet.call(window.location) : new URL(_getRawLocationHref()).pathname;
+    if (path.indexOf('/gateway/') === 0) {
+      var parts = path.split('/');
+      if (parts.length >= 5 && parts[3] === 'port') return parts.slice(0, 5).join('/');
+    } else if (path.indexOf('/preview/') === 0) {
+      var parts = path.split('/');
+      if (parts.length >= 3) return parts.slice(0, 3).join('/');
+    }
+    return '';
+  }
+  window._getPathPrefix = _getPathPrefix;
+
+  function _stripProxyPrefix(path) {
+    if (${skipPathnameStrip}) return path;
+    if (path.indexOf('/gateway/') === 0) {
+      var parts = path.split('/');
+      if (parts.length >= 5 && parts[3] === 'port') return '/' + parts.slice(5).join('/');
+    } else if (path.indexOf('/preview/') === 0) {
+      var parts = path.split('/');
+      if (parts.length >= 3) return '/' + parts.slice(3).join('/');
+    }
+    return path;
+  }
+
+  function _stripProxyPrefixFromUrl(urlStr) {
+    if (urlStr == null || urlStr === '') return urlStr;
+    try {
+      var u = new URL(String(urlStr), _getRawLocationHref());
+      if (u.origin !== window.location.origin) return urlStr;
+      var strippedPath = _stripProxyPrefix(u.pathname);
+      return u.origin + (strippedPath.startsWith('/') ? strippedPath : '/' + strippedPath) + u.search + u.hash;
+    } catch(e) { return urlStr; }
+  }
+
+  function _rewriteNavUrl(urlStr) {
+    if (urlStr == null || urlStr === '') return urlStr;
+    try {
+      var u = new URL(String(urlStr), _getRawLocationHref());
+      if (u.origin !== window.location.origin) return urlStr;
+      var rest = u.pathname + u.search + u.hash;
+      if (rest.startsWith('/gateway/') || rest.startsWith('/preview/') || rest.startsWith('/ws-static/')) return urlStr;
+      var prefix = _getPathPrefix() || ${basePathExpr};
+      if (!prefix) return urlStr;
+      return window.location.origin + prefix + (rest.startsWith('/') ? rest : '/' + rest);
+    } catch(e) { return urlStr; }
+  }
+
   try {
-    var descPathname = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname');
-    if (descPathname && descPathname.get) {
-      var origGetPathname = descPathname.get;
+    window.__gw_location = new Proxy(window.location, {
+      get: function(target, prop) {
+        if (prop === 'pathname') {
+          var rawPath = _origLocationPathnameGet ? _origLocationPathnameGet.call(target) : target.pathname;
+          return _stripProxyPrefix(rawPath);
+        }
+        if (prop === 'href') {
+          var rawHref = _origLocationHrefGet ? _origLocationHrefGet.call(target) : target.href;
+          return _stripProxyPrefixFromUrl(rawHref);
+        }
+        if (prop === 'toString') {
+          return function() {
+            var rawHref = _origLocationHrefGet ? _origLocationHrefGet.call(target) : target.toString();
+            return _stripProxyPrefixFromUrl(rawHref);
+          };
+        }
+        if (prop === 'assign' || prop === 'replace') {
+          return function(url) { return target[prop](_rewriteNavUrl(String(url))); };
+        }
+        var val = target[prop];
+        if (typeof val === 'function') return val.bind(target);
+        return val;
+      },
+      set: function(target, prop, val) {
+        if (prop === 'href') {
+          target.href = _rewriteNavUrl(String(val));
+          return true;
+        }
+        if (prop === 'pathname') {
+          var prefix = _getPathPrefix() || ${basePathExpr};
+          var p = String(val);
+          target.pathname = prefix + (p.indexOf('/') === 0 ? p : '/' + p);
+          return true;
+        }
+        target[prop] = val;
+        return true;
+      }
+    });
+  } catch (e) {
+    console.error('[GW] Failed to define window.__gw_location proxy:', e);
+  }
+
+  function patchLocationProperties() {
+    try {
+      // Override pathname
       Object.defineProperty(Location.prototype, 'pathname', {
         get: function() {
-          var path = origGetPathname.call(this);
-          if (path.indexOf('/gateway/') === 0) {
-            var parts = path.split('/');
-            if (parts.length >= 5 && parts[3] === 'port') {
-              return '/' + parts.slice(5).join('/');
+          var rawPath = _origLocationPathnameGet ? _origLocationPathnameGet.call(window.location) : window.location.pathname;
+          return _stripProxyPrefix(rawPath);
+        },
+        set: function(val) {
+          var p = String(val);
+          var prefix = _getPathPrefix() || ${basePathExpr};
+          window.location.href = prefix + (p.indexOf('/') === 0 ? p : '/' + p);
+        },
+        configurable: true,
+        enumerable: true
+      });
+
+      // Override href
+      Object.defineProperty(Location.prototype, 'href', {
+        get: function() {
+          var rawHref = _origLocationHrefGet ? _origLocationHrefGet.call(window.location) : window.location.href;
+          return _stripProxyPrefixFromUrl(rawHref);
+        },
+        set: function(val) {
+          window.location.href = _rewriteNavUrl(String(val));
+        },
+        configurable: true,
+        enumerable: true
+      });
+
+      // Override toString
+      Location.prototype.toString = function() {
+        var rawHref = _origLocationHrefGet ? _origLocationHrefGet.call(this) : _origLocationToString.call(this);
+        return _stripProxyPrefixFromUrl(rawHref);
+      };
+    } catch (e) {
+      console.error('[GW] Failed to patch location properties:', e);
+    }
+  }
+  patchLocationProperties();
+
+  try {
+    var _origAssign = Location.prototype.assign;
+    Location.prototype.assign = function(url) { return _origAssign.call(this, _rewriteNavUrl(String(url))); };
+    var _origReplace = Location.prototype.replace;
+    Location.prototype.replace = function(url) { return _origReplace.call(this, _rewriteNavUrl(String(url))); };
+  } catch (e) {
+    console.error('[GW] Failed to patch Location.assign/replace:', e);
+  }
+
+  try {
+    var _origCookieDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') || Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie');
+    if (_origCookieDescriptor && _origCookieDescriptor.set) {
+      Object.defineProperty(document, 'cookie', {
+        get: function() {
+          return _origCookieDescriptor.get.call(document);
+        },
+        set: function(val) {
+          var str = String(val);
+          var prefix = _getPathPrefix() || ${basePathExpr};
+          if (prefix) {
+            var cookiePath = prefix;
+            if (prefix.indexOf('/gateway/') === 0) {
+              var parts = prefix.split('/');
+              if (parts.length >= 3) {
+                cookiePath = parts.slice(0, 3).join('/');
+              }
+            } else if (prefix.indexOf('/preview/') === 0) {
+              cookiePath = '/preview';
             }
-          } else if (path.indexOf('/preview/') === 0) {
-            var parts = path.split('/');
-            if (parts.length >= 3) {
-              return '/' + parts.slice(3).join('/');
+            if (/path\\s*=\\s*\\/[^;]*/i.test(str)) {
+              str = str.replace(/path\\s*=\\s*\\/[^;]*/i, 'path=' + cookiePath);
+            } else if (!/path\\s*=/i.test(str)) {
+              str = str.trim().replace(/;+$/, '') + '; path=' + cookiePath;
             }
           }
-          return path;
+          _origCookieDescriptor.set.call(document, str);
         },
         configurable: true,
         enumerable: true
       });
     }
   } catch (e) {
-    console.error('[GW] Failed to patch Location.pathname:', e);
+    console.error('[GW] Failed to patch document.cookie:', e);
   }
+
+  function patchDocumentProperties() {
+    try {
+      if (_origDocumentURLGet) {
+        Object.defineProperty(document, 'URL', {
+          get: function() {
+            return _stripProxyPrefixFromUrl(_origDocumentURLGet.call(document));
+          },
+          configurable: true,
+          enumerable: true
+        });
+      }
+      if (_origDocumentURIGet) {
+        Object.defineProperty(document, 'documentURI', {
+          get: function() {
+            return _stripProxyPrefixFromUrl(_origDocumentURIGet.call(document));
+          },
+          configurable: true,
+          enumerable: true
+        });
+      }
+    } catch(e) {
+      console.error('[GW] Failed to patch document properties:', e);
+    }
+  }
+  patchDocumentProperties();
+`;
+
+// Build the gateway patcher script injected into HTML responses.
+// Transparently rewrites fetch/XHR/WebSocket calls so the browser
+// routes everything through the single gateway URL.
+const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = false, backendPort = null, backendPrefix = '/api', skipPathnameStrip = false) => {
+  const backendPortJs = backendPort ? Number(backendPort) : null;
+  return `<script>
+(function() {
+  var _workspaceName = ${JSON.stringify(workspaceName)};
+  var _currentPort   = ${currentPort};
+  var _backendPort   = ${backendPortJs === null ? 'null' : backendPortJs};
+  var _backendPrefix = ${JSON.stringify(backendPrefix || '/api')};
+  var _trailingSlash = ${trailingSlash};
+  var _gwBase        = '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + _currentPort;
+
+  console.log('[GW] Patcher script running. Workspace:', _workspaceName, 'Frontend:', _currentPort, 'Backend:', _backendPort);
+
+  function _stripGatewayPath(pathname) {
+    if (pathname.indexOf('/gateway/') === 0) {
+      var parts = pathname.split('/');
+      if (parts.length >= 5 && parts[3] === 'port') return '/' + parts.slice(5).join('/');
+    }
+    return pathname;
+  }
+
+  function _isBackendPath(pathname) {
+    if (!_backendPort || _backendPort === _currentPort) return false;
+    var p = _stripGatewayPath(pathname);
+    if (p.startsWith(_backendPrefix)) return true;
+    if (_backendPrefix.endsWith('/') && p === _backendPrefix.slice(0, -1)) return true;
+    // Common unauthenticated auth routes (EMS, etc.)
+    if (p.startsWith('/auth/') || p === '/auth') return true;
+    return false;
+  }
+
+  function _gatewayPortForPath(pathname) {
+    return _isBackendPath(pathname) ? _backendPort : _currentPort;
+  }
+
+  function _gwBaseForPath(pathname) {
+    return '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + _gatewayPortForPath(pathname);
+  }
+
+  ${buildLocationProxySnippet('_gwBase', skipPathnameStrip)}
 
   function rewriteUrl(urlStr, baseHref) {
     try {
-      var u = new URL(urlStr, baseHref || location.href);
+      var u = new URL(urlStr, baseHref || _getRawLocationHref());
       var rest = u.pathname + u.search + u.hash;
 
       // ── Same-origin relative paths ────────────────────────────────────────
@@ -158,9 +396,8 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
             rest = pathname + '/' + u.search + u.hash;
           }
         }
-        // Everything else is an app-relative path (/_next/..., /static/..., /public/..., etc.)
-        // Reroute through the gateway so it reaches the dev server
-        return location.origin + _gwBase + rest;
+        // Route /api/* (and /auth/*) through the backend port when registered
+        return location.origin + _gwBaseForPath(u.pathname) + rest;
       }
 
       // ── Explicit localhost / 127.0.0.1 URLs ──────────────────────────────
@@ -177,19 +414,22 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
               rest = pathname + '/' + u.search + u.hash;
             }
           }
-          return location.origin + '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + _currentPort + rest;
+          return location.origin + _gwBaseForPath(u.pathname) + rest;
         }
         return urlStr;
       }
       
-      // For any other localhost port (e.g. backend port 5000), route it through the gateway at that port
+      // For any other localhost port (e.g. backend port 8080), route through gateway at that port
       if (_trailingSlash) {
         var pathname = u.pathname;
         if (!pathname.endsWith('/') && !/\.[a-zA-Z0-9]+$/.test(pathname)) {
           rest = pathname + '/' + u.search + u.hash;
         }
       }
-      return location.origin + '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + port + rest;
+      var targetPort = port;
+      if (port === _currentPort) targetPort = _gatewayPortForPath(u.pathname);
+      else if (port === _backendPort) targetPort = _backendPort;
+      return location.origin + '/gateway/' + encodeURIComponent(_workspaceName) + '/port/' + targetPort + rest;
     } catch(e) { return urlStr; }
   }
 
@@ -197,7 +437,7 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
   var _OrigWS = window.WebSocket;
   function PatchedWS(url, protocols) {
     try {
-      var u = new URL(url, location.href);
+      var u = new URL(url, _getRawLocationHref());
       if (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === location.hostname) {
         var gwPort = parseInt(location.port || (location.protocol === 'https:' ? '443' : '80'));
         var port = u.port ? parseInt(u.port) : null;
@@ -265,11 +505,11 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
   function rewriteHistoryUrl(urlStr) {
     if (!urlStr) return urlStr;
     try {
-      var u = new URL(urlStr, location.href);
+      var u = new URL(urlStr, _getRawLocationHref());
       if (u.hostname === location.hostname) {
         var rest = u.pathname + u.search + u.hash;
         if (!rest.startsWith('/gateway/') && !rest.startsWith('/preview/') && !rest.startsWith('/ws-static/')) {
-          var newPath = _gwBase + (rest.startsWith('/') ? rest : '/' + rest);
+          var newPath = _gwBaseForPath(u.pathname) + (rest.startsWith('/') ? rest : '/' + rest);
           return location.origin + newPath;
         }
       }
@@ -285,7 +525,7 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
       if (target !== undefined && target !== null) {
         target = rewriteHistoryUrl(String(target));
       }
-      return _origPush.call(this, state, title, target);
+      return _origPush.call(window.history, state, title, target);
     };
 
     var _origReplace = window.history.replaceState;
@@ -294,10 +534,10 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
       if (target !== undefined && target !== null) {
         target = rewriteHistoryUrl(String(target));
       }
-      return _origReplace.call(this, state, title, target);
+      return _origReplace.call(window.history, state, title, target);
     };
 
-    var _u = new URL(window.location.href);
+    var _u = new URL(_getRawLocationHref());
     if (_u.searchParams.has('token') || _u.searchParams.has('t')) {
       _u.searchParams.delete('token'); _u.searchParams.delete('t');
       window.history.replaceState({}, document.title, _u.pathname + _u.search + _u.hash);
@@ -305,6 +545,7 @@ const buildGatewayPatcherScript = (workspaceName, currentPort, trailingSlash = f
   }
 })();
 </script>`;
+};
 
 const app = express();
 const server = http.createServer(app);
@@ -372,6 +613,38 @@ app.get('/api/files/preview', async (req, res) => {
   }
 });
 
+const getWorkspaceTrailingSlash = (workspaceName) => {
+  if (!workspaceName) return false;
+  try {
+    const wsRoot = resolveWorkspacePath(workspaceName);
+    const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+      .find(f => fs.existsSync(path.join(wsRoot, f)));
+    if (configFile) {
+      const content = fs.readFileSync(path.join(wsRoot, configFile), 'utf8');
+      return /trailingSlash\s*:\s*true/.test(content);
+    }
+  } catch (e) {
+    // ignore
+  }
+  return false;
+};
+
+const getWorkspaceHasBasePath = (workspaceName) => {
+  if (!workspaceName) return false;
+  try {
+    const wsRoot = resolveWorkspacePath(workspaceName);
+    const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+      .find(f => fs.existsSync(path.join(wsRoot, f)));
+    if (configFile) {
+      const content = fs.readFileSync(path.join(wsRoot, configFile), 'utf8');
+      return /basePath\s*:/.test(content);
+    }
+  } catch (e) {
+    // ignore
+  }
+  return false;
+};
+
 // Redirect navigation requests to / back to the gateway/preview if they came from it
 app.get('/', (req, res, next) => {
   const referer = req.headers.referer;
@@ -407,9 +680,15 @@ app.get('/', (req, res, next) => {
       if (port) {
         let targetUrl;
         if (isPreviewMode) {
-          targetUrl = `/preview/${port}/`;
+          const hasBase = getWorkspaceHasBasePath(workspaceName);
+          const trailing = getWorkspaceTrailingSlash(workspaceName);
+          const suffix = (hasBase && !trailing) ? '' : '/';
+          targetUrl = `/preview/${port}${suffix}`;
         } else {
-          targetUrl = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}/`;
+          const hasBase = getWorkspaceHasBasePath(workspaceName);
+          const trailing = getWorkspaceTrailingSlash(workspaceName);
+          const suffix = (hasBase && !trailing) ? '' : '/';
+          targetUrl = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}${suffix}`;
         }
         console.log(`[Gateway Redirect] Redirecting root navigation from Referer: ${targetUrl}`);
         return res.redirect(302, targetUrl);
@@ -576,7 +855,7 @@ function _gatewaySSE(req, res) {
   res.flushHeaders();
 
   const options = {
-    hostname: 'localhost',
+    hostname: PROXY_HOST,
     port,
     path: finalPath + (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''),
     method: 'GET',
@@ -596,7 +875,7 @@ function _gatewaySSE(req, res) {
   proxyReq.end();
 }
 
-// ── Auto-patch next.config.js with basePath + assetPrefix ────────────────────
+// ── Auto-patch next.config.js with basePath + assetPrefix + trailingSlash ───
 // POST /api/workspaces/patch-nextconfig  { workspace, port }
 app.post('/api/workspaces/patch-nextconfig', authenticate, async (req, res) => {
   const { workspace, port } = req.body;
@@ -615,19 +894,22 @@ app.post('/api/workspaces/patch-nextconfig', authenticate, async (req, res) => {
       // Create a minimal one
       configPath = path.join(wsRoot, 'next.config.mjs');
       await fs.promises.writeFile(configPath,
-        `const nextConfig = {\n  basePath: '${gwBase}',\n  assetPrefix: '${gwBase}',\n};\nexport default nextConfig;\n`
+        `const nextConfig = {\n  basePath: '${gwBase}',\n  assetPrefix: '${gwBase}',\n  trailingSlash: true,\n};\nexport default nextConfig;\n`
       );
       return res.json({ status: 'created', file: 'next.config.mjs', gwBase });
     }
     let content = await fs.promises.readFile(configPath, 'utf8');
-    // Remove existing basePath / assetPrefix lines
+    // Remove existing basePath / assetPrefix / trailingSlash lines
     content = content
       .replace(/^\s*basePath\s*:.*,?\n?/gm, '')
-      .replace(/^\s*assetPrefix\s*:.*,?\n?/gm, '');
+      .replace(/^\s*assetPrefix\s*:.*,?\n?/gm, '')
+      .replace(/^\s*trailingSlash\s*:.*,?\n?/gm, '');
     // Inject before the closing of the config object — handles both JS and TS type annotations
+    const isTs = configPath.endsWith('.ts');
+    const typeAnnotation = isTs ? ': NextConfig' : '';
     content = content.replace(
       /(const|let|var)\s+nextConfig\s*(?::\s*\w+\s*)?\s*=\s*\{/,
-      `$1 nextConfig: NextConfig = {\n  basePath: '${gwBase}',\n  assetPrefix: '${gwBase}',`
+      `$1 nextConfig${typeAnnotation} = {\n  basePath: '${gwBase}',\n  assetPrefix: '${gwBase}',\n  trailingSlash: true,`
     );
     await fs.promises.writeFile(configPath, content, 'utf8');
     res.json({ status: 'patched', file: path.basename(configPath), gwBase });
@@ -651,7 +933,11 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
   if (!authorized) return res.status(401).send('Unauthorized');
 
   if (tokenParam === SECURITY_TOKEN) {
-    res.setHeader('Set-Cookie', `portable_token=${tokenParam}; Path=/; HttpOnly; SameSite=Lax`);
+    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+    const cookieFlags = isHttps
+      ? '; Secure; SameSite=None'
+      : '; SameSite=Lax';
+    res.setHeader('Set-Cookie', `portable_token=${tokenParam}; Path=/; HttpOnly${cookieFlags}`);
   }
 
   if (req.method === 'OPTIONS') {
@@ -677,24 +963,29 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
     return res.status(400).send('Invalid port');
   }
 
-  // Only update lastActiveGatewayPort if it's not a backend API request
   const services = workspaceServices.get(workspaceName);
-  const isBackend = services && (services.backend === port || subPath.startsWith(services.backendPrefix || '/api'));
-  if (!isBackend) {
-    lastActiveGatewayPort = port;
+  const backendPrefix = services?.backendPrefix || '/api';
+
+  let targetPort = port;
+  let isBackend = false;
+  if (services && services.backend) {
+    if (port === services.backend || isBackendApiPath(subPath, backendPrefix)) {
+      targetPort = services.backend;
+      isBackend = true;
+    }
   }
 
-  // Redirect if missing trailing slash so relative paths resolve correctly
-  if (req.path === `/gateway/${encodeURIComponent(workspaceName)}/port/${port}`) {
-    const qs = req.url.slice(req.path.length);
-    return res.redirect(301, `/gateway/${encodeURIComponent(workspaceName)}/port/${port}/${qs}`);
+  // Only update lastActiveGatewayPort if it's not a backend API request
+  if (!isBackend) {
+    lastActiveGatewayPort = port;
   }
 
   // Base path of the gateway for this specific port
   const gwBase = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}`;
 
-  // Check if Next.js config contains trailingSlash: true
+  // Check if Next.js config contains trailingSlash: true and basePath
   let trailingSlash = false;
+  let hasBasePath = false;
   try {
     const wsRoot = resolveWorkspacePath(workspaceName);
     const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
@@ -702,13 +993,28 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
     if (configFile) {
       const content = fs.readFileSync(path.join(wsRoot, configFile), 'utf8');
       trailingSlash = /trailingSlash\s*:\s*true/.test(content);
+      hasBasePath = /basePath\s*:/.test(content);
     }
   } catch (e) {
     // ignore
   }
 
-  // Build the client patcher script to inject
-  const patcherScript = buildGatewayPatcherScript(workspaceName, port, trailingSlash);
+  // Redirect if missing trailing slash so relative paths resolve correctly
+  // BUT do not redirect if Next.js basePath is configured, to avoid trailing-slash loops.
+  if (req.path === `/gateway/${encodeURIComponent(workspaceName)}/port/${port}` && !hasBasePath) {
+    const qs = req.url.slice(req.path.length);
+    return res.redirect(301, `/gateway/${encodeURIComponent(workspaceName)}/port/${port}/${qs}`);
+  }
+
+  // Build the client patcher script to inject (always use frontend port from URL + backend metadata)
+  const patcherScript = buildGatewayPatcherScript(
+    workspaceName,
+    port,
+    trailingSlash,
+    services?.backend || null,
+    backendPrefix,
+    hasBasePath
+  );
 
   // Strip query token before forwarding
   const forwardQuery = { ...req.query };
@@ -719,25 +1025,51 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
   // Forward the full path including gateway prefix when basePath is set in next.config
   // so Next.js can match its own basePath-prefixed routes correctly.
   let fullTargetPath;
-  try {
-    const wsRoot = resolveWorkspacePath(workspaceName);
-    const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
-      .find(f => fs.existsSync(path.join(wsRoot, f)));
-    const hasBasePath = configFile
-      && /basePath\s*:/.test(fs.readFileSync(path.join(wsRoot, configFile), 'utf8'));
-    fullTargetPath = hasBasePath
-      ? (gwBase + (subPath === '/' ? '/' : subPath) + (qs ? `?${qs}` : ''))
-      : (subPath + (qs ? `?${qs}` : ''));
-  } catch {
+  if (isBackend) {
     fullTargetPath = subPath + (qs ? `?${qs}` : '');
+  } else {
+    try {
+      const wsRoot = resolveWorkspacePath(workspaceName);
+      const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+        .find(f => fs.existsSync(path.join(wsRoot, f)));
+      const hasBasePath = configFile
+        && /basePath\s*:/.test(fs.readFileSync(path.join(wsRoot, configFile), 'utf8'));
+
+      let nextTrailingSlash = false;
+      if (configFile) {
+        const content = fs.readFileSync(path.join(wsRoot, configFile), 'utf8');
+        nextTrailingSlash = /trailingSlash\s*:\s*true/.test(content);
+      }
+
+      const rawSubPath = match[3] || '';
+
+      if (hasBasePath) {
+        let pathSuffix = rawSubPath;
+        if (!pathSuffix) {
+          pathSuffix = nextTrailingSlash ? '/' : '';
+        }
+        fullTargetPath = gwBase + pathSuffix + (qs ? `?${qs}` : '');
+      } else {
+        fullTargetPath = (rawSubPath || '/') + (qs ? `?${qs}` : '');
+      }
+    } catch {
+      fullTargetPath = subPath + (qs ? `?${qs}` : '');
+    }
   }
 
   const proxyHeaders = {
     ...req.headers,
-    host: `localhost:${port}`,
+    host: `localhost:${targetPort}`,
     'accept-encoding': 'gzip, deflate',
   };
   delete proxyHeaders['authorization'];
+
+  // Prevent 304 Not Modified responses for HTML files so that we can always inject the gateway patcher
+  const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html');
+  if (isHtmlRequest) {
+    delete proxyHeaders['if-none-match'];
+    delete proxyHeaders['if-modified-since'];
+  }
 
   if (req.body && (typeof req.body === 'object' && Object.keys(req.body).length > 0)) {
     const contentType = req.headers['content-type'] || '';
@@ -751,8 +1083,8 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
   }
 
   const proxyOptions = {
-    hostname: 'localhost',
-    port: port,
+    hostname: PROXY_HOST,
+    port: targetPort,
     path: fullTargetPath || '/',
     method: req.method,
     headers: proxyHeaders,
@@ -771,19 +1103,27 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
     delete outHeaders['content-security-policy-report-only'];
 
     // Rewrite Set-Cookie paths to prevent cookie collision between workspaces
-    // Isolate by workspace folder prefix rather than port to allow sharing cookies between frontend and backend of the same workspace
+    // Scope cookies to this workspace's gateway port prefix
     if (outHeaders['set-cookie']) {
       const cookies = Array.isArray(outHeaders['set-cookie'])
         ? outHeaders['set-cookie']
         : [outHeaders['set-cookie']];
-      const wsBase = `/gateway/${encodeURIComponent(workspaceName)}`;
+      const cookiePath = `/gateway/${encodeURIComponent(workspaceName)}`;
+      const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+
       outHeaders['set-cookie'] = cookies.map(cookieStr => {
-        if (/path=\/[^;]*/i.test(cookieStr)) {
-          return cookieStr.replace(/path=\/[^;]*/i, `Path=${wsBase}`);
-        } else if (!/path=/i.test(cookieStr)) {
-          return cookieStr + `; Path=${wsBase}`;
+        let newCookie = cookieStr;
+        if (/path\s*=\s*\/[^;]*/i.test(newCookie)) {
+          newCookie = newCookie.replace(/path\s*=\s*\/[^;]*/i, `Path=${cookiePath}`);
+        } else if (!/path\s*=/i.test(newCookie)) {
+          newCookie = newCookie + `; Path=${cookiePath}`;
         }
-        return cookieStr;
+        if (isHttps) {
+          // Remove existing secure/samesite if any to avoid duplication
+          newCookie = newCookie.replace(/;\s*samesite=[^;]*/i, '').replace(/;\s*secure/i, '');
+          newCookie = newCookie.trim().replace(/;+$/, '') + '; Secure; SameSite=None';
+        }
+        return newCookie;
       });
     }
 
@@ -837,18 +1177,23 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
           .replace(/import\s+"\/(?!\/|gateway\/|preview\/)/g, `import "${gwBase}/`)
           .replace(/import\s+'\/(?!\/|gateway\/|preview\/)/g, `import '${gwBase}/`);
 
-        // ── Inject patcher after <meta charset> with no nonce needed (CSP stripped) ──
+        // ── Inject patcher + base href so relative URLs resolve through gateway ──
+        const baseTag = `<base href="${gwBase}/">`;
         const charsetMeta = rewritten.match(/<meta[^>]+charset[^>]*>/i);
         if (charsetMeta) {
-          rewritten = rewritten.replace(charsetMeta[0], `${charsetMeta[0]}${patcherScript}`);
+          rewritten = rewritten.replace(charsetMeta[0], `${charsetMeta[0]}${baseTag}${patcherScript}`);
         } else if (rewritten.includes('<head>')) {
-          rewritten = rewritten.replace('<head>', `<head>${patcherScript}`);
+          rewritten = rewritten.replace('<head>', `<head>${baseTag}${patcherScript}`);
         } else if (rewritten.includes('</head>')) {
-          rewritten = rewritten.replace('</head>', `${patcherScript}</head>`);
+          rewritten = rewritten.replace('</head>', `${baseTag}${patcherScript}</head>`);
         } else {
-          rewritten = patcherScript + rewritten;
+          rewritten = baseTag + patcherScript + rewritten;
         }
 
+        outHeaders['cache-control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate';
+        outHeaders['pragma'] = 'no-cache';
+        outHeaders['expires'] = '0';
+        delete outHeaders['etag'];
         outHeaders['content-length'] = Buffer.byteLength(rewritten, 'utf8');
         res.writeHead(proxyRes.statusCode, outHeaders);
         res.end(rewritten, 'utf8');
@@ -857,7 +1202,13 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
         if (!res.headersSent) res.status(502).send('Decompression error');
       });
     } else {
-      // Non-HTML content: pass through with fixed CORS headers
+      // Non-HTML content: check if it is a JavaScript file to patch window.location
+      const requestPath = subPath || '/';
+      const ext = path.extname(requestPath).toLowerCase();
+      const isJs = contentType.includes('javascript') || 
+                   ext === '.js' || ext === '.ts' || ext === '.tsx' || ext === '.jsx' ||
+                   req.path.includes('/@fs/') || req.path.includes('/@modules/');
+
       outHeaders['access-control-allow-origin'] = req.headers['origin'] || '*';
       if (req.headers['origin']) {
         outHeaders['access-control-allow-credentials'] = 'true';
@@ -867,26 +1218,79 @@ app.all('/gateway/:workspace/port/:port*', async (req, res) => {
       outHeaders['access-control-allow-headers'] = req.headers['access-control-request-headers'] || 'Content-Type, Authorization';
 
       // Fix missing MIME types
-      const requestPath = subPath || '/';
-      const ext = path.extname(requestPath).toLowerCase();
       if (ext === '.css' && !outHeaders['content-type']) {
         outHeaders['content-type'] = 'text/css; charset=utf-8';
       } else if (ext === '.js' && !outHeaders['content-type']) {
         outHeaders['content-type'] = 'application/javascript; charset=utf-8';
       }
 
-      res.writeHead(proxyRes.statusCode, outHeaders);
-      proxyRes.pipe(res, { end: true });
+      if (isJs) {
+        delete outHeaders['content-encoding'];
+        delete outHeaders['content-length'];
+
+        let stream = proxyRes;
+        if (encoding === 'gzip')         stream = proxyRes.pipe(zlib.createGunzip());
+        else if (encoding === 'deflate')  stream = proxyRes.pipe(zlib.createInflate());
+        else if (encoding === 'br')       stream = proxyRes.pipe(zlib.createBrotliDecompress());
+
+        let body = '';
+        stream.setEncoding('utf8');
+        stream.on('data', chunk => { body += chunk; });
+        stream.on('end', () => {
+          let rewritten = body;
+          
+          // Rewrite window.location and document.location to our proxy window.__gw_location
+          rewritten = rewritten
+            .replace(/\bwindow\.location\b/g, 'window.__gw_location')
+            .replace(/\bdocument\.location\b/g, 'window.__gw_location');
+
+          // Rewrite BrowserRouter to dynamically fall back to gateway pathname prefix as basename
+          rewritten = rewritten.replace(
+            /\bfunction\s+BrowserRouter\s*\(([^)]*)\)\s*\{/g,
+            (match, p1) => {
+              const param = p1.trim();
+              if (param.startsWith('{')) {
+                return `function BrowserRouter(${p1}) { try { basename = basename || (window._getPathPrefix ? window._getPathPrefix() : undefined); } catch(e) {}`;
+              }
+              return `function BrowserRouter(${p1}) { ${param} = { ...${param}, basename: ${param}.basename || (window._getPathPrefix ? window._getPathPrefix() : undefined) };`;
+            }
+          );
+
+          // Rewrite hardcoded localhost backend URLs baked into Vite env (e.g. VITE_BACKEND_URL)
+          if (services?.backend) {
+            const backendGw = `/gateway/${encodeURIComponent(workspaceName)}/port/${services.backend}`;
+            rewritten = rewritten.replace(
+              new RegExp(`https?:\\/\\/(localhost|127\\.0\\.0\\.1):${services.backend}`, 'g'),
+              backendGw
+            );
+          }
+
+          outHeaders['cache-control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate';
+          outHeaders['pragma'] = 'no-cache';
+          outHeaders['expires'] = '0';
+          delete outHeaders['etag'];
+          outHeaders['content-length'] = Buffer.byteLength(rewritten, 'utf8');
+          res.writeHead(proxyRes.statusCode, outHeaders);
+          res.end(rewritten, 'utf8');
+        });
+        stream.on('error', () => {
+          if (!res.headersSent) res.status(502).send('Decompression error');
+        });
+      } else {
+        res.writeHead(proxyRes.statusCode, outHeaders);
+        proxyRes.pipe(res, { end: true });
+      }
     }
   });
 
   proxyReq.on('error', (err) => {
+    console.error(`[Gateway Proxy] ${req.method} ${fullTargetPath} → ${PROXY_HOST}:${targetPort} FAILED: ${err.message}`);
     if (!res.headersSent) {
       res.status(502).type('html').send(`
         <html><body style="background:#0a0a0a;color:#e5e7eb;font-family:monospace;padding:40px;max-width:600px;margin:auto">
           <h2 style="color:#f87171">⚡ Port unreachable</h2>
-          <p>Cannot connect to <strong style="color:#fff">localhost:${port}</strong></p>
-          <p style="color:#9ca3af">Is the dev server running on port ${port}? Check your terminal tab.</p>
+          <p>Cannot connect to <strong style="color:#fff">${PROXY_HOST}:${targetPort}</strong></p>
+          <p style="color:#9ca3af">Is the dev server running on port ${targetPort}? Check your terminal tab.</p>
           <pre style="background:#111;border:1px solid #333;padding:12px;border-radius:8px;color:#f87171;margin-top:8px">${err.message}</pre>
         </body></html>`);
     }
@@ -918,7 +1322,11 @@ app.all('/preview/:port*', (req, res) => {
 
   // Set cookie if token was passed in query to establish session
   if (tokenParam === SECURITY_TOKEN) {
-    res.setHeader('Set-Cookie', `portable_token=${tokenParam}; Path=/; HttpOnly; SameSite=Lax`);
+    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+    const cookieFlags = isHttps
+      ? '; Secure; SameSite=None'
+      : '; SameSite=Lax';
+    res.setHeader('Set-Cookie', `portable_token=${tokenParam}; Path=/; HttpOnly${cookieFlags}`);
   }
 
   const port = parseInt(req.params.port, 10);
@@ -927,8 +1335,54 @@ app.all('/preview/:port*', (req, res) => {
   }
   
   const subPath = req.params[0] || '/';
-  if (port !== 8080 && !subPath.startsWith('/api')) {
+  
+  // Lookup workspace name if port is known
+  let workspaceName = null;
+  for (const [wsName, svcs] of workspaceServices.entries()) {
+    if (svcs.frontend === port || svcs.backend === port) {
+      workspaceName = wsName;
+      break;
+    }
+  }
+
+  // Check if Next.js config contains basePath
+  let hasBasePath = false;
+  if (workspaceName) {
+    try {
+      const wsRoot = resolveWorkspacePath(workspaceName);
+      const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+        .find(f => fs.existsSync(path.join(wsRoot, f)));
+      if (configFile) {
+        const content = fs.readFileSync(path.join(wsRoot, configFile), 'utf8');
+        hasBasePath = /basePath\s*:/.test(content);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  let targetPort = port;
+  let isBackend = false;
+  if (workspaceName) {
+    const services = workspaceServices.get(workspaceName);
+    const backendPrefix = services?.backendPrefix || '/api';
+    if (services && services.backend) {
+      if (port === services.backend || isBackendApiPath(subPath, backendPrefix)) {
+        targetPort = services.backend;
+        isBackend = true;
+      }
+    }
+  }
+
+  if (!isBackend) {
     lastActiveGatewayPort = port;
+  }
+
+  // Redirect if missing trailing slash so relative paths resolve correctly
+  // BUT do not redirect if Next.js basePath is configured, to avoid trailing-slash loops.
+  if (req.path === `/preview/${port}` && !hasBasePath) {
+    const qs = req.url.slice(req.path.length);
+    return res.redirect(301, `/preview/${port}/${qs}`);
   }
 
   // Handle CORS preflight — browsers send this before every cross-origin API call
@@ -954,13 +1408,43 @@ app.all('/preview/:port*', (req, res) => {
   urlObj.searchParams.delete('t');
   const targetPath = (urlObj.pathname || '/') + (urlObj.search || '');
 
+  // Prepend basePath if Next.js config contains it, so Next.js matches the path
+  let fullTargetPath;
+  if (hasBasePath && workspaceName) {
+    const gwBase = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}`;
+    let pathSuffix = req.params[0] || '';
+    if (!pathSuffix) {
+      let nextTrailingSlash = false;
+      try {
+        const wsRoot = resolveWorkspacePath(workspaceName);
+        const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+          .find(f => fs.existsSync(path.join(wsRoot, f)));
+        if (configFile) {
+          const content = fs.readFileSync(path.join(wsRoot, configFile), 'utf8');
+          nextTrailingSlash = /trailingSlash\s*:\s*true/.test(content);
+        }
+      } catch (e) {}
+      pathSuffix = nextTrailingSlash ? '/' : '';
+    }
+    fullTargetPath = gwBase + pathSuffix + (urlObj.search || '');
+  } else {
+    fullTargetPath = targetPath;
+  }
+
   const proxyHeaders = {
     ...req.headers,
-    host: `localhost:${port}`,
+    host: `localhost:${targetPort}`,
     // Accept both compressed and plain — we'll handle decompression ourselves
     'accept-encoding': 'gzip, deflate',
   };
   delete proxyHeaders['authorization'];
+
+  // Prevent 304 Not Modified responses for HTML files so that we can always inject the gateway patcher
+  const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html');
+  if (isHtmlRequest) {
+    delete proxyHeaders['if-none-match'];
+    delete proxyHeaders['if-modified-since'];
+  }
 
   if (req.body && (typeof req.body === 'object' && Object.keys(req.body).length > 0)) {
     const contentType = req.headers['content-type'] || '';
@@ -974,9 +1458,9 @@ app.all('/preview/:port*', (req, res) => {
   }
 
   const options = {
-    hostname: 'localhost',
-    port,
-    path: targetPath,
+    hostname: PROXY_HOST,
+    port: targetPort,
+    path: fullTargetPath,
     method: req.method,
     headers: proxyHeaders,
   };
@@ -992,31 +1476,43 @@ app.all('/preview/:port*', (req, res) => {
     delete outHeaders['content-security-policy'];
     delete outHeaders['content-security-policy-report-only'];
 
-    // Rewrite Set-Cookie paths to prevent cookie collision between workspaces
-    // Allow sharing cookies between all preview ports since they reside under /preview
+    // Rewrite Set-Cookie paths so app cookies stay scoped to this preview port
     if (outHeaders['set-cookie']) {
       const cookies = Array.isArray(outHeaders['set-cookie'])
         ? outHeaders['set-cookie']
         : [outHeaders['set-cookie']];
+      const pathPrefix = `/preview`;
+      const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+
       outHeaders['set-cookie'] = cookies.map(cookieStr => {
-        const pathPrefix = `/preview`;
-        if (/path=\/[^;]*/i.test(cookieStr)) {
-          return cookieStr.replace(/path=\/[^;]*/i, `Path=${pathPrefix}`);
-        } else if (!/path=/i.test(cookieStr)) {
-          return cookieStr + `; Path=${pathPrefix}`;
+        let newCookie = cookieStr;
+        if (/path\s*=\s*\/[^;]*/i.test(newCookie)) {
+          newCookie = newCookie.replace(/path\s*=\s*\/[^;]*/i, `Path=${pathPrefix}`);
+        } else if (!/path\s*=/i.test(newCookie)) {
+          newCookie = newCookie + `; Path=${pathPrefix}`;
         }
-        return cookieStr;
+        if (isHttps) {
+          newCookie = newCookie.replace(/;\s*samesite=[^;]*/i, '').replace(/;\s*secure/i, '');
+          newCookie = newCookie.trim().replace(/;+$/, '') + '; Secure; SameSite=None';
+        }
+        return newCookie;
       });
     }
 
     // Rewrite redirect locations to stay within the proxy
     if (outHeaders.location) {
       const loc = outHeaders.location;
-      if (loc.startsWith('/') && !loc.startsWith(`/preview/${port}`)) {
+      const gwBase = workspaceName ? `/gateway/${encodeURIComponent(workspaceName)}/port/${port}` : null;
+
+      if (gwBase && loc.startsWith(gwBase)) {
+        outHeaders.location = `/preview/${port}${loc.substring(gwBase.length)}`;
+      } else if (loc.startsWith('/') && !loc.startsWith(`/preview/${port}`)) {
         outHeaders.location = `/preview/${port}${loc}`;
       } else {
         const relativeLoc = loc.replace(/^https?:\/\/(localhost|127\.0\.0\.1):\d+/, '');
-        if (relativeLoc.startsWith('/') && !relativeLoc.startsWith(`/preview/${port}`)) {
+        if (gwBase && relativeLoc.startsWith(gwBase)) {
+          outHeaders.location = `/preview/${port}${relativeLoc.substring(gwBase.length)}`;
+        } else if (relativeLoc.startsWith('/') && !relativeLoc.startsWith(`/preview/${port}`)) {
           outHeaders.location = `/preview/${port}${relativeLoc}`;
         } else {
           outHeaders.location = relativeLoc;
@@ -1046,7 +1542,11 @@ app.all('/preview/:port*', (req, res) => {
         let rewritten = body
           .replace(/(src|href|action)="\/(?!\/)/g, `$1="/preview/${port}/`)
           .replace(/(src|href|action)='\/(?!\/)/g,  `$1='/preview/${port}/`)
-          .replace(/url\(\/(?!\/)/g,                `url(/preview/${port}/`);
+          .replace(/url\(\/(?!\/)/g,                `url(/preview/${port}/`)
+          .replace(/from\s+"\/(?!\/|gateway\/|preview\/)/g, `from "/preview/${port}/`)
+          .replace(/from\s+'\/(?!\/|gateway\/|preview\/)/g, `from '/preview/${port}/`)
+          .replace(/import\s+"\/(?!\/|gateway\/|preview\/)/g, `import "/preview/${port}/`)
+          .replace(/import\s+'\/(?!\/|gateway\/|preview\/)/g, `import '/preview/${port}/`);
 
         // ── Proxy Patcher Script ─────────────────────────────────────────────
         // Injected before any app code runs. Transparently routes:
@@ -1054,45 +1554,85 @@ app.all('/preview/:port*', (req, res) => {
         //   • fetch() calls to localhost:port → /preview/:port/...
         //   • XMLHttpRequest calls to localhost:port → /preview/:port/...
         // Zero changes required in any project.
+        const previewBase = `/preview/${port}/`;
+        const previewSvc = workspaceName ? workspaceServices.get(workspaceName) : null;
+        const previewBackendPort = previewSvc?.backend || null;
+        const previewBackendPrefix = previewSvc?.backendPrefix || '/api';
+        let skipPathnameStrip = false;
+        if (workspaceName) {
+          try {
+            const wsRoot = resolveWorkspacePath(workspaceName);
+            const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
+              .find(f => fs.existsSync(path.join(wsRoot, f)));
+            if (configFile) {
+              const content = fs.readFileSync(path.join(wsRoot, configFile), 'utf8');
+              skipPathnameStrip = /basePath\s*:/.test(content);
+            }
+          } catch (e) {}
+        }
         const scriptToInject = `<script>
 (function() {
-  var _proxyPort = ${port};
+  var _frontendPort = ${port};
+  var _proxyPort = _frontendPort;
+  var _backendPort = ${previewBackendPort ? previewBackendPort : 'null'};
+  var _backendPrefix = ${JSON.stringify(previewBackendPrefix)};
+  var _previewBase = '/preview/' + _frontendPort;
 
-  // Patch Location.prototype.pathname to transparently hide gateway/preview prefixes from routers
-  try {
-    var descPathname = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname');
-    if (descPathname && descPathname.get) {
-      var origGetPathname = descPathname.get;
-      Object.defineProperty(Location.prototype, 'pathname', {
-        get: function() {
-          var path = origGetPathname.call(this);
-          if (path.indexOf('/gateway/') === 0) {
-            var parts = path.split('/');
-            if (parts.length >= 5 && parts[3] === 'port') {
-              return '/' + parts.slice(5).join('/');
-            }
-          } else if (path.indexOf('/preview/') === 0) {
-            var parts = path.split('/');
-            if (parts.length >= 3) {
-              return '/' + parts.slice(3).join('/');
-            }
-          }
-          return path;
-        },
-        configurable: true,
-        enumerable: true
-      });
+  console.log('[GW-Preview] Patcher script running. Frontend:', _frontendPort, 'Backend:', _backendPort);
+  ${buildLocationProxySnippet("'/preview/' + _frontendPort", skipPathnameStrip)}
+
+  function _stripPreviewPath(pathname) {
+    if (pathname.indexOf('/preview/') === 0) {
+      var parts = pathname.split('/');
+      if (parts.length >= 3) return '/' + parts.slice(3).join('/');
     }
-  } catch (e) {
-    console.error('[GW] Failed to patch Location.pathname:', e);
+    return pathname;
+  }
+
+  function _previewPortForPath(pathname) {
+    if (!_backendPort || _backendPort === _frontendPort) return _frontendPort;
+    var p = _stripPreviewPath(pathname);
+    if (p.startsWith(_backendPrefix) || (_backendPrefix.endsWith('/') && p === _backendPrefix.slice(0, -1)) || p.startsWith('/auth/') || p === '/auth') {
+      return _backendPort;
+    }
+    return _frontendPort;
+  }
+
+  function rewritePreviewUrl(urlStr, baseHref) {
+    try {
+      var u = new URL(urlStr, baseHref || _getRawLocationHref());
+      if (u.hostname === location.hostname) {
+        var rest = u.pathname + u.search + u.hash;
+        if (!rest.startsWith('/gateway/') && !rest.startsWith('/preview/') && !rest.startsWith('/ws-static/')) {
+          var targetPort = _previewPortForPath(u.pathname);
+          return location.origin + '/preview/' + targetPort + (rest.startsWith('/') ? rest : '/' + rest);
+        }
+        return urlStr;
+      }
+      if (u.hostname !== 'localhost' && u.hostname !== '127.0.0.1') return urlStr;
+      var p = u.port ? parseInt(u.port) : 80;
+      var gwPort = parseInt(location.port || (location.protocol === 'https:' ? '443' : '80'));
+      if (p === gwPort) {
+        var rest = u.pathname + u.search + u.hash;
+        if (!rest.startsWith('/gateway/') && !rest.startsWith('/preview/') && !rest.startsWith('/ws-static/')) {
+          var targetPort = _previewPortForPath(u.pathname);
+          return location.origin + '/preview/' + targetPort + rest;
+        }
+        return urlStr;
+      }
+      var rest = u.pathname + u.search + u.hash;
+      var targetPort = p;
+      if (p === _frontendPort) targetPort = _previewPortForPath(u.pathname);
+      else if (p === _backendPort) targetPort = _backendPort;
+      return location.origin + '/preview/' + targetPort + rest;
+    } catch(e) { return urlStr; }
   }
 
   // 1. Patch WebSocket — redirect HMR and dev-server sockets through proxy
   var _OrigWS = window.WebSocket;
   function PatchedWS(url, protocols) {
     try {
-      var u = new URL(url, location.href);
-      // Redirect any localhost:port WS or any WS to current host root
+      var u = new URL(url, _getRawLocationHref());
       var targetPort = u.port ? parseInt(u.port) : (u.hostname === location.hostname ? _proxyPort : null);
       if (targetPort && (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === location.hostname)) {
         var proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -1109,45 +1649,49 @@ app.all('/preview/:port*', (req, res) => {
   PatchedWS.CLOSED = _OrigWS.CLOSED;
   window.WebSocket = PatchedWS;
 
-  // 2. Patch fetch — redirect localhost API calls through proxy
+  // 2. Patch fetch — route same-origin and localhost calls through preview proxy
   var _origFetch = window.fetch;
   window.fetch = function(input, init) {
     try {
-      var urlStr = (input instanceof Request) ? input.url : input;
-      if (typeof urlStr === 'string') {
-        var u = new URL(urlStr);
-        if ((u.hostname === 'localhost' || u.hostname === '127.0.0.1') && u.port) {
-          var newUrl = location.origin + '/preview/' + u.port + u.pathname + u.search + u.hash;
-          input = (input instanceof Request) ? new Request(newUrl, input) : newUrl;
+      var urlStr = (input instanceof Request) ? input.url : String(input);
+      var rewritten = rewritePreviewUrl(urlStr);
+      if (rewritten !== urlStr) {
+        if (input instanceof Request) {
+          var initOpts = {};
+          var keys = ['method', 'headers', 'credentials', 'cache', 'redirect', 'referrer', 'integrity', 'keepalive', 'signal'];
+          for (var i = 0; i < keys.length; i++) {
+            var k = keys[i];
+            if (input[k] !== undefined) initOpts[k] = input[k];
+          }
+          if (input.mode !== 'navigate') initOpts.mode = input.mode;
+          if (input.method !== 'GET' && input.method !== 'HEAD') {
+            try { initOpts.body = input.clone().body; } catch(e) {}
+          }
+          input = new Request(rewritten, initOpts);
+        } else {
+          input = rewritten;
         }
       }
     } catch(e) {}
     return _origFetch.call(this, input, init);
   };
 
-  // 3. Patch XMLHttpRequest — same redirect
+  // 3. Patch XMLHttpRequest
   var _origOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url) {
-    try {
-      if (typeof url === 'string') {
-        var u = new URL(url, location.href);
-        if ((u.hostname === 'localhost' || u.hostname === '127.0.0.1') && u.port) {
-          url = location.origin + '/preview/' + u.port + u.pathname + u.search + u.hash;
-        }
-      }
-    } catch(e) {}
-    return _origOpen.apply(this, arguments);
+    try { if (typeof url === 'string') url = rewritePreviewUrl(url); } catch(e) {}
+    return _origOpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments, 2)));
   };
 
   function rewriteHistoryUrl(urlStr) {
     if (!urlStr) return urlStr;
     try {
-      var u = new URL(urlStr, location.href);
+      var u = new URL(urlStr, _getRawLocationHref());
       if (u.hostname === location.hostname) {
         var rest = u.pathname + u.search + u.hash;
         if (!rest.startsWith('/gateway/') && !rest.startsWith('/preview/') && !rest.startsWith('/ws-static/')) {
-          var newPath = '/preview/' + _proxyPort + (rest.startsWith('/') ? rest : '/' + rest);
-          return location.origin + newPath;
+          var targetPort = _previewPortForPath(u.pathname);
+          return location.origin + '/preview/' + targetPort + (rest.startsWith('/') ? rest : '/' + rest);
         }
       }
       return urlStr;
@@ -1162,7 +1706,7 @@ app.all('/preview/:port*', (req, res) => {
       if (target !== undefined && target !== null) {
         target = rewriteHistoryUrl(String(target));
       }
-      return _origPush.call(this, state, title, target);
+      return _origPush.call(window.history, state, title, target);
     };
 
     var _origReplace = window.history.replaceState;
@@ -1171,10 +1715,10 @@ app.all('/preview/:port*', (req, res) => {
       if (target !== undefined && target !== null) {
         target = rewriteHistoryUrl(String(target));
       }
-      return _origReplace.call(this, state, title, target);
+      return _origReplace.call(window.history, state, title, target);
     };
 
-    var url = new URL(window.location.href);
+    var url = new URL(_getRawLocationHref());
     if (url.searchParams.has('token') || url.searchParams.has('t')) {
       url.searchParams.delete('token');
       url.searchParams.delete('t');
@@ -1184,9 +1728,10 @@ app.all('/preview/:port*', (req, res) => {
 })();
 </script>`;
 
-        // Inject as the very first thing inside <head> so it runs before any app JS
+        // Inject patcher + base href as the very first thing inside <head>
+        const baseTag = `<base href="${previewBase}">`;
         if (rewritten.includes('<head>')) {
-          rewritten = rewritten.replace('<head>', `<head>${scriptToInject}`);
+          rewritten = rewritten.replace('<head>', `<head>${baseTag}${scriptToInject}`);
         } else if (rewritten.includes('</head>')) {
           rewritten = rewritten.replace('</head>', `${scriptToInject}</head>`);
         } else if (rewritten.includes('</body>')) {
@@ -1195,6 +1740,10 @@ app.all('/preview/:port*', (req, res) => {
           rewritten = scriptToInject + rewritten;
         }
 
+        outHeaders['cache-control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate';
+        outHeaders['pragma'] = 'no-cache';
+        outHeaders['expires'] = '0';
+        delete outHeaders['etag'];
         outHeaders['content-length'] = Buffer.byteLength(rewritten, 'utf8');
         res.writeHead(proxyRes.statusCode, outHeaders);
         res.end(rewritten, 'utf8');
@@ -1203,7 +1752,13 @@ app.all('/preview/:port*', (req, res) => {
         if (!res.headersSent) res.status(502).send('Decompression error');
       });
     } else {
-      // Non-HTML: pass through (images, JS, CSS etc.)
+      // Non-HTML: check if it is a JavaScript file to patch window.location
+      const requestPath = suffix || '/';
+      const ext = path.extname(requestPath).toLowerCase();
+      const isJs = contentType.includes('javascript') || 
+                   ext === '.js' || ext === '.ts' || ext === '.tsx' || ext === '.jsx' ||
+                   req.path.includes('/@fs/') || req.path.includes('/@modules/');
+
       // Fix CORS headers so browser accepts API responses from the proxied backend
       outHeaders['access-control-allow-origin'] = req.headers['origin'] || '*';
       if (req.headers['origin']) {
@@ -1214,23 +1769,65 @@ app.all('/preview/:port*', (req, res) => {
       outHeaders['access-control-allow-headers'] = req.headers['access-control-request-headers'] || 'Content-Type, Authorization';
 
       // Ensure proper MIME types
-      const requestPath = suffix || '/';
-      const ext = path.extname(requestPath).toLowerCase();
-      
       if (ext === '.css' && !outHeaders['content-type']) {
         outHeaders['content-type'] = 'text/css; charset=utf-8';
       } else if (ext === '.js' && !outHeaders['content-type']) {
         outHeaders['content-type'] = 'application/javascript; charset=utf-8';
       }
-      
-      res.writeHead(proxyRes.statusCode, outHeaders);
-      proxyRes.pipe(res, { end: true });
+
+      if (isJs) {
+        delete outHeaders['content-encoding'];
+        delete outHeaders['content-length'];
+
+        let stream = proxyRes;
+        if (encoding === 'gzip')         stream = proxyRes.pipe(zlib.createGunzip());
+        else if (encoding === 'deflate')  stream = proxyRes.pipe(zlib.createInflate());
+        else if (encoding === 'br')       stream = proxyRes.pipe(zlib.createBrotliDecompress());
+
+        let body = '';
+        stream.setEncoding('utf8');
+        stream.on('data', chunk => { body += chunk; });
+        stream.on('end', () => {
+          let rewritten = body;
+          
+          // Rewrite window.location and document.location to our proxy window.__gw_location
+          rewritten = rewritten
+            .replace(/\bwindow\.location\b/g, 'window.__gw_location')
+            .replace(/\bdocument\.location\b/g, 'window.__gw_location');
+
+          // Rewrite BrowserRouter to dynamically fall back to gateway pathname prefix as basename
+          rewritten = rewritten.replace(
+            /\bfunction\s+BrowserRouter\s*\(([^)]*)\)\s*\{/g,
+            (match, p1) => {
+              const param = p1.trim();
+              if (param.startsWith('{')) {
+                return `function BrowserRouter(${p1}) { try { basename = basename || (window._getPathPrefix ? window._getPathPrefix() : undefined); } catch(e) {}`;
+              }
+              return `function BrowserRouter(${p1}) { ${param} = { ...${param}, basename: ${param}.basename || (window._getPathPrefix ? window._getPathPrefix() : undefined) };`;
+            }
+          );
+
+          outHeaders['cache-control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate';
+          outHeaders['pragma'] = 'no-cache';
+          outHeaders['expires'] = '0';
+          delete outHeaders['etag'];
+          outHeaders['content-length'] = Buffer.byteLength(rewritten, 'utf8');
+          res.writeHead(proxyRes.statusCode, outHeaders);
+          res.end(rewritten, 'utf8');
+        });
+        stream.on('error', () => {
+          if (!res.headersSent) res.status(502).send('Decompression error');
+        });
+      } else {
+        res.writeHead(proxyRes.statusCode, outHeaders);
+        proxyRes.pipe(res, { end: true });
+      }
     }
   });
 
   proxyReq.on('error', (err) => {
     if (!res.headersSent) {
-      res.status(502).send(`Cannot connect to localhost:${port} — is the dev server running?\n\n${err.message}`);
+      res.status(502).send(`Cannot connect to localhost:${targetPort} — is the dev server running?\n\n${err.message}`);
     }
   });
 
@@ -1578,6 +2175,65 @@ app.get('/api/workspaces/topology', authenticate, async (req, res) => {
   });
 });
 
+// ── Windows port detection fallback (when PowerShell CIM fails) ─────────────
+const detectPortsWindowsNetstat = (normalizedWsPath) => {
+  try {
+    const netstatOut = execSync('netstat -ano', { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    const portPidMap = new Map();
+    for (const line of netstatOut.split('\n')) {
+      const m = line.trim().match(/^(?:TCP|UDP)\s+\S+:(\d+)\s+\S+\s+(\w+)\s+(\d+)\s*$/i);
+      if (!m || m[2].toUpperCase() !== 'LISTENING') continue;
+      const port = parseInt(m[1], 10);
+      const pid = m[3];
+      if (port && port !== Number(PORT)) portPidMap.set(port, pid);
+    }
+    const matchedPorts = [];
+    for (const [port, pid] of portPidMap.entries()) {
+      try {
+        const cmdOut = execSync(`wmic process where "ProcessId=${pid}" get CommandLine /value`, {
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 5000,
+        });
+        const cmdNorm = cmdOut.replace(/\\/g, '/').toLowerCase();
+        if (cmdNorm.includes(normalizedWsPath)) matchedPorts.push(port);
+      } catch {
+        // skip pid
+      }
+    }
+    return [...new Set(matchedPorts)].sort((a, b) => a - b);
+  } catch (err) {
+    console.error('[Gateway] netstat port detection failed:', err.message);
+    return [];
+  }
+};
+
+const registerDetectedPorts = (workspace, detectedPorts) => {
+  const existing = workspaceServices.get(workspace) || {};
+  const frontendCandidates = detectedPorts.filter(p => p < 6000);
+  const backendCandidates  = detectedPorts.filter(p => p >= 6000);
+  const newSvc = {
+    frontend: existing.frontend || frontendCandidates[0] || detectedPorts[0],
+    backend:  existing.backend || backendCandidates[0] || (detectedPorts.length > 1 ? detectedPorts[1] : null),
+    backendPrefix: existing.backendPrefix || '/api',
+  };
+  workspaceServices.set(workspace, newSvc);
+  console.log(`[Gateway] Auto-registered ports for ${workspace}:`, newSvc);
+  return newSvc;
+};
+
+const respondWithDetectedPorts = (workspace, detectedPorts, res) => {
+  if (detectedPorts.length > 0) {
+    registerDetectedPorts(workspace, detectedPorts);
+    const topology = workspaceServices.get(workspace) || null;
+    const gateway = topology
+      ? `/gateway/${encodeURIComponent(workspace)}/port/${topology.frontend || '3000'}/`
+      : null;
+    return res.json({ port: detectedPorts[0], ports: detectedPorts, topology, gateway });
+  }
+  return res.json({ port: null, ports: [], topology: null, gateway: null });
+};
+
 // Detect the active port for a workspace by scanning processes
 app.get('/api/workspaces/detect-port', authenticate, async (req, res) => {
   const { workspace } = req.query;
@@ -1611,7 +2267,12 @@ app.get('/api/workspaces/detect-port', authenticate, async (req, res) => {
       const cmd = `powershell -NoProfile -Command "Get-NetTCPConnection -State Listen | ForEach-Object { $proc = Get-CimInstance Win32_Process -Filter \\"ProcessId = $($_.OwningProcess)\\" -ErrorAction SilentlyContinue; if ($proc) { [PSCustomObject]@{ Port = $_.LocalPort; Path = $proc.ExecutablePath; Cmd = $proc.CommandLine } } } | ConvertTo-Json"`;
       exec(cmd, (error, stdout, stderr) => {
         if (error) {
-          console.error('Error detecting port:', error);
+          console.error('Error detecting port (powershell):', error.message);
+          const fallbackPorts = detectPortsWindowsNetstat(normalizedWsPath);
+          if (fallbackPorts.length > 0) {
+            console.log(`[Gateway] netstat fallback found ports for ${workspace}:`, fallbackPorts);
+            return respondWithDetectedPorts(workspace, fallbackPorts, res);
+          }
           return res.json({ port: null });
         }
         try {
@@ -1629,29 +2290,14 @@ app.get('/api/workspaces/detect-port', authenticate, async (req, res) => {
           if (matches.length > 0) {
             matches.sort((a, b) => a.Port - b.Port);
             const detectedPorts = matches.map(m => Number(m.Port));
-
-            // Auto-register ports into the gateway service registry
-            // Heuristic: ports < 6000 are usually frontend (3000, 5173)
-            //            ports >= 6000 are usually backend (8000, 8080, etc.)
-            const existing = workspaceServices.get(workspace) || {};
-            if (!existing.frontend && detectedPorts.length >= 1) {
-              const frontendCandidates = detectedPorts.filter(p => p < 6000);
-              const backendCandidates  = detectedPorts.filter(p => p >= 6000);
-              const newSvc = {
-                frontend: frontendCandidates[0] || detectedPorts[0],
-                backend:  backendCandidates[0]  || (detectedPorts.length > 1 ? detectedPorts[1] : null),
-                backendPrefix: existing.backendPrefix || '/api',
-              };
-              workspaceServices.set(workspace, newSvc);
-              console.log(`[Gateway] Auto-registered ports for ${workspace}:`, newSvc);
-            }
-
-            const topology = workspaceServices.get(workspace) || null;
-            const gateway  = topology ? `/gateway/${encodeURIComponent(workspace)}/port/${topology.frontend || '3000'}/` : null;
-            return res.json({ port: detectedPorts[0], ports: detectedPorts, topology, gateway });
+            return respondWithDetectedPorts(workspace, detectedPorts, res);
           }
         } catch (e) {
           console.error('Error parsing process JSON:', e);
+          const fallbackPorts = detectPortsWindowsNetstat(normalizedWsPath);
+          if (fallbackPorts.length > 0) {
+            return respondWithDetectedPorts(workspace, fallbackPorts, res);
+          }
         }
         res.json({ port: null, ports: [], topology: null, gateway: null });
       });
@@ -2677,6 +3323,19 @@ app.all('*', (req, res, next) => {
     }
   }
 
+  let targetPort = port;
+  let isBackend = false;
+  let services = null;
+  if (workspaceName) {
+    services = workspaceServices.get(workspaceName);
+    if (services && services.backend) {
+      if (port === services.backend || isBackendApiPath(req.url, services.backendPrefix || '/api')) {
+        targetPort = services.backend;
+        isBackend = true;
+      }
+    }
+  }
+
   if (port) {
     // Verify token via cookie or referer parameter
     let cookieToken = null;
@@ -2703,7 +3362,7 @@ app.all('*', (req, res, next) => {
     if (isAuthed || isFromPreview) {
       // Reconstruct target path with basePath if Next.js config contains it
       let targetPath = req.url;
-      if (workspaceName) {
+      if (workspaceName && !isBackend) {
         try {
           const wsRoot = resolveWorkspacePath(workspaceName);
           const configFile = ['next.config.mjs','next.config.js','next.config.ts','next.config.cjs']
@@ -2717,9 +3376,15 @@ app.all('*', (req, res, next) => {
           if (isHtmlRequest && !isAlreadyPrefixed) {
             let targetUrl;
             if (isPreviewMode) {
-              targetUrl = `/preview/${port}${req.url}`;
+              const hasBase = getWorkspaceHasBasePath(workspaceName);
+              const trailing = getWorkspaceTrailingSlash(workspaceName);
+              const suffix = (hasBase && !trailing && req.url === '/') ? '' : req.url;
+              targetUrl = `/preview/${port}${suffix}`;
             } else {
-              targetUrl = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}${req.url}`;
+              const hasBase = getWorkspaceHasBasePath(workspaceName);
+              const trailing = getWorkspaceTrailingSlash(workspaceName);
+              const suffix = (hasBase && !trailing && req.url === '/') ? '' : req.url;
+              targetUrl = `/gateway/${encodeURIComponent(workspaceName)}/port/${port}${suffix}`;
             }
             console.log(`[Gateway Redirect] Redirecting HTML navigation: ${req.url} → ${targetUrl}`);
             return res.redirect(302, targetUrl);
@@ -2731,34 +3396,130 @@ app.all('*', (req, res, next) => {
         } catch (e) {}
       }
 
-      // Proxy request to localhost:port
+      // Proxy request to localhost:targetPort
       const options = {
-        hostname: 'localhost',
-        port,
+        hostname: PROXY_HOST,
+        port: targetPort,
         path: targetPath,
         method: req.method,
         headers: {
           ...req.headers,
-          host: `localhost:${port}`,
+          host: `localhost:${targetPort}`,
         },
       };
       
       delete options.headers['authorization'];
 
       const proxyReq = http.request(options, (proxyRes) => {
+        const contentType = proxyRes.headers['content-type'] || '';
+        const encoding = proxyRes.headers['content-encoding'] || '';
+        const ext = path.extname(req.path).toLowerCase();
+        const isJs = contentType.includes('javascript') || 
+                     ext === '.js' || ext === '.ts' || ext === '.tsx' || ext === '.jsx' ||
+                     req.path.includes('/@fs/') || req.path.includes('/@modules/');
+
         const outHeaders = { ...proxyRes.headers };
+        // Rewrite Set-Cookie paths in fallback proxy so backend auth actions are properly scoped
+        if (outHeaders['set-cookie'] && (workspaceName || isPreviewMode)) {
+          const cookies = Array.isArray(outHeaders['set-cookie'])
+            ? outHeaders['set-cookie']
+            : [outHeaders['set-cookie']];
+          const cookiePath = isPreviewMode 
+            ? `/preview` 
+            : `/gateway/${encodeURIComponent(workspaceName)}`;
+          const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+
+          outHeaders['set-cookie'] = cookies.map(cookieStr => {
+            let newCookie = cookieStr;
+            if (/path\s*=\s*\/[^;]*/i.test(newCookie)) {
+              newCookie = newCookie.replace(/path\s*=\s*\/[^;]*/i, `Path=${cookiePath}`);
+            } else if (!/path\s*=/i.test(newCookie)) {
+              newCookie = newCookie + `; Path=${cookiePath}`;
+            }
+            if (isHttps) {
+              newCookie = newCookie.replace(/;\s*samesite=[^;]*/i, '').replace(/;\s*secure/i, '');
+              newCookie = newCookie.trim().replace(/;+$/, '') + '; Secure; SameSite=None';
+            }
+            return newCookie;
+          });
+        }
+
         outHeaders['access-control-allow-origin'] = req.headers['origin'] || '*';
         if (req.headers['origin']) {
           outHeaders['access-control-allow-credentials'] = 'true';
           outHeaders['vary'] = (outHeaders['vary'] ? outHeaders['vary'] + ', ' : '') + 'Origin';
         }
-        res.writeHead(proxyRes.statusCode, outHeaders);
-        proxyRes.pipe(res, { end: true });
+        outHeaders['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
+        outHeaders['access-control-allow-headers'] = req.headers['access-control-request-headers'] || 'Content-Type, Authorization';
+
+        // Ensure proper MIME types for css/js if missing
+        if (ext === '.css' && !outHeaders['content-type']) {
+          outHeaders['content-type'] = 'text/css; charset=utf-8';
+        } else if (ext === '.js' && !outHeaders['content-type']) {
+          outHeaders['content-type'] = 'application/javascript; charset=utf-8';
+        }
+
+        if (isJs) {
+          delete outHeaders['content-encoding'];
+          delete outHeaders['content-length'];
+
+          let stream = proxyRes;
+          if (encoding === 'gzip')         stream = proxyRes.pipe(zlib.createGunzip());
+          else if (encoding === 'deflate')  stream = proxyRes.pipe(zlib.createInflate());
+          else if (encoding === 'br')       stream = proxyRes.pipe(zlib.createBrotliDecompress());
+
+          let body = '';
+          stream.setEncoding('utf8');
+          stream.on('data', chunk => { body += chunk; });
+          stream.on('end', () => {
+            let rewritten = body;
+            
+            // Rewrite window.location and document.location to our proxy window.__gw_location
+            rewritten = rewritten
+              .replace(/\bwindow\.location\b/g, 'window.__gw_location')
+              .replace(/\bdocument\.location\b/g, 'window.__gw_location');
+
+            // Rewrite BrowserRouter to dynamically fall back to gateway pathname prefix as basename
+            rewritten = rewritten.replace(
+              /\bfunction\s+BrowserRouter\s*\(([^)]*)\)\s*\{/g,
+              (match, p1) => {
+                const param = p1.trim();
+                if (param.startsWith('{')) {
+                  return `function BrowserRouter(${p1}) { try { basename = basename || (window._getPathPrefix ? window._getPathPrefix() : undefined); } catch(e) {}`;
+                }
+                return `function BrowserRouter(${p1}) { ${param} = { ...${param}, basename: ${param}.basename || (window._getPathPrefix ? window._getPathPrefix() : undefined) };`;
+              }
+            );
+
+            // Rewrite hardcoded localhost backend URLs baked into Vite env (e.g. VITE_BACKEND_URL)
+            if (services?.backend) {
+              const backendGw = `/gateway/${encodeURIComponent(workspaceName)}/port/${services.backend}`;
+              rewritten = rewritten.replace(
+                new RegExp(`https?:\\/\\/(localhost|127\\.0\\.0\\.1):${services.backend}`, 'g'),
+                backendGw
+              );
+            }
+
+            outHeaders['cache-control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate';
+            outHeaders['pragma'] = 'no-cache';
+            outHeaders['expires'] = '0';
+            delete outHeaders['etag'];
+            outHeaders['content-length'] = Buffer.byteLength(rewritten, 'utf8');
+            res.writeHead(proxyRes.statusCode, outHeaders);
+            res.end(rewritten, 'utf8');
+          });
+          stream.on('error', () => {
+            if (!res.headersSent) res.status(502).send('Decompression error');
+          });
+        } else {
+          res.writeHead(proxyRes.statusCode, outHeaders);
+          proxyRes.pipe(res, { end: true });
+        }
       });
 
       proxyReq.on('error', (err) => {
         if (!res.headersSent) {
-          res.status(502).send(`Fallback Proxy Error: ${err.message}`);
+          res.status(502).send(`Fallback Proxy Error (localhost:${targetPort}): ${err.message}`);
         }
       });
 
@@ -2802,6 +3563,14 @@ server.on('upgrade', (req, socket, head) => {
       subPath = subPath.substring(gatewayPrefix.length) || '/';
     }
 
+    const services = workspaceServices.get(workspaceName);
+    let targetPort = port;
+    if (services && services.backend) {
+      if (port === services.backend || isBackendApiPath(subPath, services.backendPrefix || '/api')) {
+        targetPort = services.backend;
+      }
+    }
+
     // Prepend basePath if Next.js config contains it
     let finalPath = subPath;
     try {
@@ -2820,7 +3589,7 @@ server.on('upgrade', (req, socket, head) => {
     // Append original search parameters (HMR client ID, etc.)
     finalPath += url.search || '';
 
-    console.log(`[Gateway WS] ${workspaceName} → localhost:${port}${finalPath}`);
+    console.log(`[Gateway WS] ${workspaceName} → localhost:${targetPort}${finalPath}`);
 
     let cookieToken = null;
     if (req.headers.cookie) {
@@ -2838,7 +3607,7 @@ server.on('upgrade', (req, socket, head) => {
     // Forward the full WS handshake headers to the upstream dev server
     const forwardHeaders = [
       `GET ${finalPath} HTTP/1.1`,
-      `Host: localhost:${port}`,
+      `Host: localhost:${targetPort}`,
       `Upgrade: websocket`,
       `Connection: Upgrade`,
       `Sec-WebSocket-Key: ${req.headers['sec-websocket-key']}`,
@@ -2852,9 +3621,9 @@ server.on('upgrade', (req, socket, head) => {
     }
     forwardHeaders.push('', '');
 
-    const upstream = net.connect(port, 'localhost', () => {
+    const upstream = net.connect(targetPort, 'localhost', () => {
       upstream.write(forwardHeaders.join('\r\n'));
-      console.log(`[Gateway WS] Connected to localhost:${port}`);
+      console.log(`[Gateway WS] Connected to localhost:${targetPort}`);
     });
     upstream.on('error', (err) => { 
       console.error(`[Gateway WS] Upstream error: ${err.message}`);
@@ -2877,6 +3646,25 @@ server.on('upgrade', (req, socket, head) => {
     const subPath = previewMatch[2] || '/';
     const searchString = url.search || '';
 
+    // Lookup workspace name if port is known
+    let workspaceName = null;
+    for (const [wsName, svcs] of workspaceServices.entries()) {
+      if (svcs.frontend === port || svcs.backend === port) {
+        workspaceName = wsName;
+        break;
+      }
+    }
+
+    let targetPort = port;
+    if (workspaceName) {
+      const services = workspaceServices.get(workspaceName);
+      if (services && services.backend) {
+        if (port === services.backend || isBackendApiPath(subPath, services.backendPrefix || '/api')) {
+          targetPort = services.backend;
+        }
+      }
+    }
+
     // Auth: token in query OR cookie
     let cookieToken = null;
     if (req.headers.cookie) {
@@ -2895,10 +3683,10 @@ server.on('upgrade', (req, socket, head) => {
     }
 
     // Pipe the WebSocket upgrade through to the local dev server
-    const upstream = net.connect(port, 'localhost', () => {
+    const upstream = net.connect(targetPort, 'localhost', () => {
       upstream.write(
         `GET ${subPath}${searchString} HTTP/1.1\r\n` +
-        `Host: localhost:${port}\r\n` +
+        `Host: localhost:${targetPort}\r\n` +
         `Upgrade: websocket\r\n` +
         `Connection: Upgrade\r\n` +
         `Sec-WebSocket-Key: ${req.headers['sec-websocket-key']}\r\n` +
@@ -2946,11 +3734,30 @@ server.on('upgrade', (req, socket, head) => {
   }
 
   if (port && (cookieToken === SECURITY_TOKEN)) {
+    // Lookup workspace name if port is known
+    let workspaceName = null;
+    for (const [wsName, svcs] of workspaceServices.entries()) {
+      if (svcs.frontend === port || svcs.backend === port) {
+        workspaceName = wsName;
+        break;
+      }
+    }
+
+    let targetPort = port;
+    if (workspaceName) {
+      const services = workspaceServices.get(workspaceName);
+      if (services && services.backend) {
+        if (port === services.backend || isBackendApiPath(url.pathname, services.backendPrefix || '/api')) {
+          targetPort = services.backend;
+        }
+      }
+    }
+
     // Proxy this WS to the detected preview port
-    const upstream = net.connect(port, 'localhost', () => {
+    const upstream = net.connect(targetPort, 'localhost', () => {
       upstream.write(
         `GET ${url.pathname}${url.search} HTTP/1.1\r\n` +
-        `Host: localhost:${port}\r\n` +
+        `Host: localhost:${targetPort}\r\n` +
         `Upgrade: websocket\r\n` +
         `Connection: Upgrade\r\n` +
         `Sec-WebSocket-Key: ${req.headers['sec-websocket-key']}\r\n` +
